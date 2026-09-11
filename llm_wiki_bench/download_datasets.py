@@ -30,7 +30,7 @@ def download_hotpotqa(output_dir: Path):
     import urllib.request
 
     url = "http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_dev_distractor_v1.json"
-    out_path = output_dir / "hotpotqa_dev.json"
+    out_path = output_dir / "hotpot_dev_distractor_v1.json"
 
     if out_path.exists():
         print(f"  ✅ HotpotQA dev already exists: {out_path}")

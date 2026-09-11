@@ -156,6 +156,12 @@ def main():
     args.only = None
     if sum(only_flags) > 1:
         parser.error("Use at most one of --only-download / --only-preprocess / --only-ingest.")
+    if args.only_download:
+        args.only = "download"
+    elif args.only_preprocess:
+        args.only = "preprocess"
+    elif args.only_ingest:
+        args.only = "ingest"
 
     if not args.dataset and not args.all:
         parser.error("Specify --dataset DATASET or --all.")

@@ -25,8 +25,8 @@ import sys
 from pathlib import Path
 from collections import defaultdict
 
-BASE_DIR = Path(__file__).parent
-DATASETS_DIR = BASE_DIR / "datasets"
+BASE_DIR = Path(__file__).parent.parent          # repo root (same as bench_config / evaluate / run_qa)
+DATASETS_DIR = Path(__file__).parent / "datasets"  # same as download_datasets.DATASETS_DIR
 RAW_DIR = BASE_DIR / "raw"
 DATA_DIR = BASE_DIR / "data"
 
