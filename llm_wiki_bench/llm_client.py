@@ -64,8 +64,10 @@ def call_llm(
     }
     if expect_json:
         payload["response_format"] = {"type": "json_object"}
-    if enable_thinking:
-        # Pass-through fields for backends that support reasoning / thinking mode.
+    if enable_thinking and "api.openai.com" not in _api_base():
+        # Pass-through field for backends that support reasoning / thinking mode
+        # (vLLM GLM/Qwen). OpenAI rejects unknown arguments with HTTP 400, so
+        # it is only sent to non-OpenAI endpoints.
         payload["chat_template_kwargs"] = {"enable_thinking": True}
 
     _llm_logger.info(
