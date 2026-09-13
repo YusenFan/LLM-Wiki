@@ -99,6 +99,9 @@ def evaluate(qa_pairs: list[dict], predictions: dict) -> tuple[dict, list[dict]]
     hop_f1: dict[int, list[float]] = {}
     type_f1: dict[str, list[float]] = {}
     details: list[dict] = []
+    llm_calls = elapsed_seconds = citation_count = gap_count = summary_reference_count = 0
+    source_title_recall = []
+    usage_by_model = {}
 
     for qa in qa_pairs:
         qid = qa["id"]
@@ -123,6 +126,19 @@ def evaluate(qa_pairs: list[dict], predictions: dict) -> tuple[dict, list[dict]]
         pages = len(pred.get("retrieved_titles", []) or [])
         steps_sum += steps
         pages_sum += pages
+        llm_calls += pred.get("llm_calls", 0)
+        elapsed_seconds += pred.get("elapsed_seconds", 0)
+        citation_count += len(pred.get("citations", []))
+        summary_reference_count += len(pred.get('summary_refs', []))
+        gap_count += bool(pred.get("evidence_gaps"))
+        for model, counts in pred.get("usage_by_model", {}).items():
+            target = usage_by_model.setdefault(model, {})
+            for key, value in counts.items():
+                target[key] = target.get(key, 0) + value
+        gold_titles = {_normalize_answer(t) for t in qa.get("supporting_titles", [])}
+        read_titles = {_normalize_answer(t) for t in pred.get("retrieved_titles", [])}
+        if gold_titles:
+            source_title_recall.append(len(gold_titles & read_titles) / len(gold_titles))
 
         hop = len(qa.get("supporting_titles", [])) or 1
         hop_f1.setdefault(hop, []).append(scores["f1"])
@@ -153,6 +169,13 @@ def evaluate(qa_pairs: list[dict], predictions: dict) -> tuple[dict, list[dict]]
         "f1": f1_sum / total,
         "avg_retrieval_steps": steps_sum / total,
         "avg_pages_read": pages_sum / total,
+        "avg_llm_calls": llm_calls / total,
+        "avg_elapsed_seconds": elapsed_seconds / total,
+        "avg_citations": citation_count / total,
+        "avg_summary_references": summary_reference_count / total,
+        "evidence_gap_rate": gap_count / total,
+        "supporting_title_read_recall_proxy": sum(source_title_recall) / len(source_title_recall) if source_title_recall else None,
+        "usage_by_model": usage_by_model,
         "hop_wise_f1": {
             f"{h}-hop": {"f1": sum(v) / len(v), "count": len(v)}
             for h, v in sorted(hop_f1.items())

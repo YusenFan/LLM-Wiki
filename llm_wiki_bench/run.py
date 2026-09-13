@@ -102,8 +102,8 @@ def step_ingest(dataset: str, batch_size: int = 3, force: bool = False) -> bool:
     print(f"  📂 Articles: {len(article_paths)}")
     print(f"  📁 Wiki output: {config.WIKI_DIR}")
 
-    bench_ingest.ingest_batch(article_paths, batch_size=batch_size, force=force)
-    return True
+    result = bench_ingest.ingest_batch(article_paths, batch_size=batch_size, force=force)
+    return result["failed"] == 0 and result.get('summaries', {}).get('failed', 0) == 0
 
 
 def run_one(dataset: str, args) -> bool:
@@ -138,7 +138,7 @@ def main():
     parser.add_argument("--limit", "-n", type=int, default=500,
                         help="Limit the number of QA examples processed (default: 500).")
     parser.add_argument("--batch-size", type=int, default=3,
-                        help="Ingest batch size (articles per LLM call group).")
+                        help="Compatibility option; documents now build independently.")
     parser.add_argument("--force", action="store_true",
                         help="Re-ingest articles even if cached.")
 

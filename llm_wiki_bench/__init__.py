@@ -20,6 +20,8 @@ __all__ = [
     "bench_config",
     "llm_client",
     "bench_ingest",
+    "build_summaries",
+    "summary_store",
     "bench_error_book",
     "preprocess_bench",
     "download_datasets",

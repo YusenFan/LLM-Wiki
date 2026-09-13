@@ -2,8 +2,8 @@
 
 For each QA pair this script
 
-  1. invokes the Wiki agent (Retrieval-as-Reasoning) to gather evidence,
-  2. asks an answer LLM to produce a short final answer from that evidence,
+  1. lets the premium Answer Agent explore and verify original evidence,
+  2. validates its final answer, citations, and evidence gaps,
   3. writes a JSONL prediction file, and (optionally) runs evaluation.
 
 Usage:
@@ -28,155 +28,10 @@ if str(_BENCH_DIR) not in sys.path:
 
 import bench_config as config                        # noqa: E402
 import evaluate as _evaluate                         # noqa: E402
-from llm_client import call_llm, call_llm_with_tools  # noqa: E402
+from llm_client import call_llm_with_tools  # noqa: E402
 from wiki_agent import WikiAgent                     # noqa: E402
 from wiki_retriever import WikiRetriever             # noqa: E402
 
-
-# ─── Answer prompt (dataset-agnostic) ─────────────────────────────────────
-#
-# Matches the answer-generation protocol used to produce the paper's reported
-# numbers (and the other baselines in this benchmark, e.g. Dense/BM25 RAG,
-# GraphRAG, LightRAG, HippoRAG2): the retrieved context is the primary
-# evidence source, but the model MAY fall back on its own parametric
-# knowledge when the context is incomplete. This keeps LLM-Wiki's answer
-# policy consistent with every other system under comparison — only the
-# retrieval side (Wiki structure + agentic search/read) differs.
-
-_ANSWER_SYSTEM_PROMPT = """You are a multi-hop question answering assistant. Answer the question using the provided context as your primary reference. If the context is incomplete, you may supplement with your own knowledge.
-
-## Instructions
-1. The question may require combining facts from MULTIPLE pages to derive the answer.
-2. First identify which pages contain relevant facts, then chain the facts together step by step.
-3. For comparison questions ("which is older/larger/..."), extract the specific values from each entity and compare.
-4. For bridge questions ("who is the director of the film starring X"), follow the chain: find X's film -> find that film's director.
-5. For yes/no questions ("Are A and B both X?"), check each entity separately, then combine.
-6. Use the Retrieval Path (if provided) as a hint for how the information connects.
-7. **NATIONALITY COMPARISON RULES** (critical for "same country" questions):
-   - A person's nationality is determined by their COUNTRY OF ORIGIN (birth country), not where they later moved.
-   - "French-American" means the person is originally FROM FRANCE (born in France, later moved to America). Their nationality is FRENCH.
-   - Similarly: "Italian-American" = Italian, "German-British" = German, "Irish-American" = Irish, etc.
-   - If person A is "French" and person B is "French-American" (born in France), they ARE from the same country (France).
-   - When comparing nationalities, focus on the ROOT nationality (the first/origin part of hyphenated descriptions).
-   - "American film" does NOT mean the director is American -- check the director's actual nationality/birthplace.
-8. **IMPORTANT**: Try your BEST to answer even with partial information. Make reasonable inferences from available context and your own knowledge.
-9. If the context does not fully cover the answer, use your own knowledge to fill in the gaps.
-10. Only say "unknown" if you truly cannot determine the answer from either the context or your own knowledge.
-
-## OUTPUT FORMAT (CRITICAL -- you MUST follow this exactly)
-- Output ONLY the final answer, nothing else.
-- Do NOT output any reasoning, explanation, or thought process.
-- Do NOT start with "Based on...", "According to...", "The answer is...", "Looking at...", or any prefix.
-- Do NOT output sentences -- just the answer itself (a name, date, number, yes/no, or short phrase).
-- For yes/no questions: output ONLY "yes" or "no" (lowercase).
-- **Give the SHORTEST possible answer**:
-  - For locations: give ONLY the city/region name, do NOT include country or administrative divisions (e.g., "Springfield" not "Springfield, Illinois, USA").
-  - For dates: match the granularity of the question. If the question asks "what year", answer with just the year (e.g., "1990" not "June 15, 1990").
-  - For people: use the shortest commonly recognized name (e.g., "Tom" if unambiguous, not "Thomas James Wilson III").
-  - For entities: use the most concise identifying name without unnecessary qualifiers.
-- Examples of CORRECT output: "yes", "no", "John Smith", "1990", "Springfield", "Portland"
-- Examples of WRONG output: "Based on the context, the answer is John Smith.", "Springfield, Illinois, United States", "June 15, 1990" (when only year is asked)"""
-
-_ANSWER_USER_TEMPLATE = """## Context (from Wiki knowledge base)
-{context}
-
-## Question
-{question}
-
-## Final Answer (ONLY the answer, no explanation):"""
-
-
-# ─── Helpers ──────────────────────────────────────────────────────────────
-
-def _format_context(pages: list[tuple[str, str]], pages_text: dict[str, str]) -> str:
-    if not pages:
-        return "(no pages retrieved)"
-    chunks = []
-    for rel_path, name in pages:
-        body = pages_text.get(rel_path, "")
-        chunks.append(f"### {name}\n**Path**: {rel_path}\n\n{body}")
-    return "\n\n".join(chunks)
-
-
-_THINKING_STEP_RE = re.compile(r'^\d+\.\s*\*\*.*\*\*', re.MULTILINE)
-
-_UNKNOWN_INDICATORS = (
-    "i cannot find any information",
-    "there is no information in the context",
-    "the pages do not contain any information",
-    "none of the retrieved pages",
-    "the context does not provide",
-    "no relevant information was found",
-)
-
-_PREFIXES_TO_REMOVE = (
-    "based on the provided context,", "based on the context,",
-    "based on the retrieval path,", "based on the retrieved pages,",
-    "according to the context,", "according to the pages,",
-    "the answer is:", "the answer is", "answer:", "final answer:",
-    "looking at this question step by step:", "looking at the context,",
-    "the question asks",
-)
-
-
-def _extract_clean_answer(raw: str) -> str:
-    """Extract a clean final answer from raw LLM output.
-
-    Handles common formatting issues seen with `enable_thinking=True`:
-    1. strips a leading numbered "thinking steps" block if the model leaked one,
-    2. strips filler prefixes ("Based on...", "The answer is...", ...),
-    3. maps clearly "no evidence found" phrasing to "unknown",
-    4. for long outputs, falls back to the shortest non-bullet line as the answer,
-    5. trims a trailing period on short phrase-style answers.
-    """
-    answer = raw.strip()
-
-    if _THINKING_STEP_RE.match(answer):
-        lines = [l.strip() for l in answer.split("\n") if l.strip()]
-        non_thinking_lines = [
-            l for l in lines
-            if not re.match(r'^\d+\.\s*\*\*', l) and not l.startswith(("-", "*", "#"))
-            and len(l) < 150
-        ]
-        if non_thinking_lines:
-            answer = non_thinking_lines[-1]
-        else:
-            return "unknown"
-
-    for prefix in _PREFIXES_TO_REMOVE:
-        if answer.lower().startswith(prefix):
-            answer = answer[len(prefix):].strip().lstrip(",: ").strip()
-            break
-
-    answer_lower = answer.lower()
-    for indicator in _UNKNOWN_INDICATORS:
-        if indicator in answer_lower and len(answer) > 100:
-            return "unknown"
-
-    if len(answer) > 200:
-        lines = [l.strip() for l in answer.split("\n") if l.strip()]
-        short_lines = [l for l in lines if len(l) < 100 and not l.startswith(("-", "*", "#"))]
-        answer = short_lines[-1] if short_lines else (lines[0] if lines else answer)
-
-    if answer.endswith(".") and len(answer) < 80:
-        answer = answer[:-1].strip()
-
-    return answer.strip()
-
-
-def _answer(question: str, context: str, model: str | None = None) -> str:
-    raw = call_llm(
-        system_prompt=_ANSWER_SYSTEM_PROMPT,
-        user_prompt=_ANSWER_USER_TEMPLATE.format(question=question, context=context),
-        temperature=0.0,
-        max_tokens=2048,
-        model=model,
-        enable_thinking=True,
-    )
-    return _extract_clean_answer(raw)
-
-
-# ─── Main ─────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -186,16 +41,18 @@ def main() -> None:
                         choices=["hotpotqa", "musique", "2wikimhqa"])
     parser.add_argument("--limit", "-n", type=int, default=None,
                         help="Process only the first N QA pairs.")
-    parser.add_argument("--t-max", type=int, default=15,
-                        help="Maximum tool-call budget per question (default 15).")
+    parser.add_argument("--t-max", type=int, default=30,
+                        help="Maximum tool-call budget per question (default 30).")
     parser.add_argument("--patience", type=int, default=3,
-                        help="Stop after this many consecutive empty searches (default 3).")
+                        help="Deprecated compatibility option; exploration now stops by evidence or budget.")
     parser.add_argument("--select-pages", type=int, default=5,
                         help="Maximum pages selected per wiki_search (default 5).")
     parser.add_argument("--retrieval-model", default=None,
-                        help="Model used for the retrieval agent (default: LLM_PREMIUM_MODEL).")
+                        help="Deprecated compatibility option; QA uses one answer model.")
     parser.add_argument("--answer-model", default=None,
-                        help="Model used to write the final answer (default: LLM_MODEL).")
+                        help="Primary exploration and answer model (default: LLM_PREMIUM_MODEL).")
+    parser.add_argument("--search-mode", choices=["bm25", "exact_then_bm25"], default="bm25")
+    parser.add_argument("--no-subtasks", action="store_true", help="Compatibility option; subtasks are already disabled.")
     parser.add_argument("--output", "-o", default=None,
                         help="Predictions output path (default: results/<dataset>/predictions.jsonl).")
     parser.add_argument("--evaluate", action="store_true",
@@ -205,7 +62,6 @@ def main() -> None:
 
     # 1. Locate the compiled Wiki for this dataset.
     config.set_dataset(args.dataset)
-    config.ensure_wiki_dirs()
     wiki_dir = Path(config.WIKI_DIR)
     if not wiki_dir.exists():
         sys.exit(f"❌ Compiled wiki not found: {wiki_dir}\n"
@@ -226,15 +82,17 @@ def main() -> None:
     print(f"T_max={args.t_max}  P={args.patience}  k={args.select_pages}")
 
     # 3. Initialize retriever + agent.
-    retriever = WikiRetriever(wiki_dir)
+    retriever = WikiRetriever(wiki_dir, search_mode=args.search_mode)
     retriever.load()
+    if not retriever.pages:
+        sys.exit("Compiled Wiki has no readable pages; build it before running QA.")
     print(f"Loaded   : {len(retriever.pages)} pages, {len(retriever.dir_indexes)} directory indices")
 
-    retrieval_model = args.retrieval_model or getattr(config, "LLM_PREMIUM_MODEL", None) or config.LLM_MODEL
     agent = WikiAgent(
         retriever,
         call_llm_with_tools=call_llm_with_tools,
-        model=retrieval_model,
+        model=args.answer_model or config.LLM_PREMIUM_MODEL,
+        allow_subtasks=False,
         t_max=args.t_max,
         patience=args.patience,
         select_pages=args.select_pages,
@@ -253,8 +111,7 @@ def main() -> None:
             question = qa["question"]
             try:
                 rr = agent.retrieve(question)
-                context = _format_context(rr.pages, rr.pages_text)
-                prediction = _answer(question, context, model=args.answer_model)
+                prediction = rr.answer
             except Exception as e:  # noqa: BLE001
                 print(f"  [{i}/{len(qa_pairs)}] ❌ {qa['id']}: {e}")
                 prediction = "unknown"
@@ -268,6 +125,18 @@ def main() -> None:
                 "retrieved_titles": [name for _, name in (rr.pages if rr else [])],
                 "retrieval_trace": rr.trace if rr else [],
                 "retrieval_steps": rr.total_calls if rr else 0,
+                "citations": rr.citations if rr else [],
+                "summary_refs": rr.summary_refs if rr else [],
+                "reasoning": rr.reasoning if rr else "",
+                "status": rr.status if rr else "failed",
+                "evidence_gaps": rr.evidence_gaps if rr else ["QA execution failed"],
+                "evidence_updates": rr.evidence_updates if rr else [],
+                "tool_trace": rr.tool_calls if rr else [],
+                "llm_calls": rr.llm_calls if rr else 0,
+                "usage_by_model": rr.usage_by_model if rr else {},
+                "elapsed_seconds": rr.elapsed_seconds if rr else 0,
+                "search_mode": args.search_mode,
+                "candidate_limit": args.select_pages,
             }
             fout.write(json.dumps(record, ensure_ascii=False) + "\n")
             fout.flush()

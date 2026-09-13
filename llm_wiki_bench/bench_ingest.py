@@ -24,6 +24,8 @@ from pathlib import Path
 
 # ─── Path setup ───
 BENCH_DIR = Path(__file__).parent
+if str(BENCH_DIR) not in sys.path:
+    sys.path.append(str(BENCH_DIR))
 
 # Use bench_config in place of the engine config.
 import bench_config as config
@@ -5347,7 +5349,7 @@ def save_cache(cache: dict):
 
 
 
-def ingest_single(article_path: Path, cache: dict, force: bool = False) -> bool:
+def _legacy_ingest_single(article_path: Path, cache: dict, force: bool = False) -> bool:
     """Ingest a single article."""
     try:
         text = article_path.read_text(encoding="utf-8")
@@ -5668,7 +5670,7 @@ def _ingest_batch_one(batch_paths: list[Path], cache: dict, force: bool = False)
     return {"success": len(articles), "failed": 0}
 
 
-def ingest_batch(article_paths: list[Path], batch_size: int = 5,
+def _legacy_ingest_batch(article_paths: list[Path], batch_size: int = 5,
                  limit: int = None, force: bool = False):
     """Ingest articles in batches (with periodic maintenance and final repair)."""
     cache = load_cache()
@@ -5788,6 +5790,23 @@ def ingest_batch(article_paths: list[Path], batch_size: int = 5,
 
 
 
+def ingest_single(article_path: Path, cache: dict | None = None, force: bool = False) -> bool:
+    """Compile one document using validated version receipts; old SHA caches are ignored."""
+    from build_agent import ingest_documents
+    result = ingest_documents([article_path], force=force)
+    return result["failed"] == 0 and result.get('summaries', {}).get('failed', 0) == 0
+
+
+def ingest_batch(article_paths: list[Path], batch_size: int = 5,
+                 limit: int | None = None, force: bool = False):
+    """Process documents independently; batch_size retained for CLI compatibility.
+
+    Do not run legacy whole-page repair/merge passes over incrementally managed facts.
+    """
+    from build_agent import ingest_documents
+    return ingest_documents(article_paths, force=force, limit=limit)
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Benchmark Wiki ingestion")
@@ -5797,7 +5816,7 @@ def main():
     parser.add_argument("--limit", "-l", type=int, default=None,
                         help="Limit number of articles to ingest")
     parser.add_argument("--batch-size", "-b", type=int, default=3,
-                        help="Batch size: articles per LLM call (default: 3)")
+                        help="Compatibility option; documents now build independently")
     parser.add_argument("--force", "-f", action="store_true",
                         help="Force re-ingest already processed articles")
     args = parser.parse_args()
@@ -5805,7 +5824,7 @@ def main():
     config.set_dataset(args.dataset)
     config.ensure_wiki_dirs()
 
-    raw_dir = BENCH_DIR / "raw" / args.dataset / "articles"
+    raw_dir = config.RAW_DIR
     if not raw_dir.exists():
         print(f"❌ Raw articles directory not found: {raw_dir}")
         print(f"   Please run: python preprocess_bench.py --dataset {args.dataset}")
@@ -5824,8 +5843,10 @@ def main():
         article_paths = article_paths[:args.limit]
         print(f"🔢 Limited to {args.limit} articles")
 
-    ingest_batch(article_paths, batch_size=args.batch_size,
-                 limit=args.limit, force=args.force)
+    result = ingest_batch(article_paths, batch_size=args.batch_size,
+                          limit=args.limit, force=args.force)
+    if result["failed"] or result.get('summaries', {}).get('failed', 0):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

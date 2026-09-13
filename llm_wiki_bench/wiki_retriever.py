@@ -1,58 +1,34 @@
-"""Wiki retriever — implements the two paper-defined tools `wiki_search` and
-`wiki_read` over a compiled LLM-Wiki directory.
-
-The retrieval design follows the paper (§3.2):
-
-* **wiki_search(query, limit?)** — searches the Wiki index by *prioritizing
-  structured signals such as page names, aliases, tags, and descriptions
-  before falling back to page content*. It returns candidate pages and
-  metadata (no body text) for subsequent reading and traversal.
-* **wiki_read(paths)** — batch-reads directory indices (`_index.md`) or full
-  pages. For knowledge pages, the returned content includes inter-page
-  wikilinks that serve as traversal affordances for subsequent hops.
-
-Scoring (each query sub-token contributes its single highest field hit; all
-sub-token contributions are summed):
-
-    name exact         100
-    name substring      80
-    alias exact         90
-    alias substring     70
-    tag  exact/substr   50
-    description substr  40
-
-A BM25 score over (name + description + body) is added on top, capped so it
-cannot outrank a structural exact match.
-"""
-
+"""Live filesystem navigation, BM25 candidates, exact entities and precise reads."""
 from __future__ import annotations
 
 import json
-import logging
 import math
 import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
 
-_logger = logging.getLogger("llm_wiki.retriever")
+import yaml
+try:
+    from .wiki_store import SourceStore, digest, fact_state, frontmatter, safe_path, unwrap_markdown
+    from .summary_store import SummaryStore, summary_state, summary_text
+except ImportError:
+    from wiki_store import SourceStore, digest, fact_state, frontmatter, safe_path, unwrap_markdown
+    from summary_store import SummaryStore, summary_state, summary_text
 
-
-# ─── Data structures ──────────────────────────────────────────────────────
 
 @dataclass
 class WikiPage:
-    """A single compiled Wiki page."""
-    name: str                                        # file stem (no .md)
-    dir_name: str                                    # directory under wiki/
-    rel_path: str                                    # e.g. "entities/Einstein.md"
-    text: str                                        # full markdown (with frontmatter)
-    body: str                                        # markdown without frontmatter
+    name: str
+    dir_name: str
+    rel_path: str
+    text: str
+    body: str
     aliases: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
-    description: str = ""                            # one-line "> ..." blockquote
-    links_to: list[str] = field(default_factory=list)  # [[wikilink]] targets
+    description: str = ''
+    links_to: list[str] = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -62,392 +38,325 @@ class SearchResult:
     matched_fields: list[str] = field(default_factory=list)
 
 
-# ─── Retriever ────────────────────────────────────────────────────────────
-
 class WikiRetriever:
-    """Loads a compiled Wiki and exposes `search` / `read` tools."""
-
-    # BM25 hyper-parameters
-    _BM25_K1 = 1.2
-    _BM25_B = 0.75
-    _BM25_WEIGHT = 5.0   # scale factor on the BM25 score before adding
-    _BM25_CAP = 60.0     # cap on the BM25 contribution (< exact-name score 100)
-
-    _TOKEN_RE = re.compile(r"[a-z0-9]+")
-
-    def __init__(self, wiki_dir: Path):
+    def __init__(self, wiki_dir: Path, search_mode: str = 'bm25', reranker=None):
+        if search_mode not in ('bm25', 'exact_then_bm25'):
+            raise ValueError('unsupported search mode')
         self.wiki_dir = Path(wiki_dir)
+        self.search_mode, self.reranker = search_mode, reranker
         self.pages: dict[str, WikiPage] = {}
-        self.dir_indexes: dict[str, str] = {}        # dir_name → _index.md content
-        self._loaded = False
-
-        # BM25 inverted index
-        self._inv: dict[str, dict[str, int]] = {}     # token → {rel_path: tf}
-        self._doc_len: dict[str, int] = {}            # rel_path → doc length
-        self._avg_dl: float = 0.0
-        self._idf: dict[str, float] = {}
-
-    # ── loading ───────────────────────────────────────────────────────────
+        self.dir_indexes: dict[str, str] = {}
+        self.directories: dict[str, str] = {}
+        self.errors: list[dict] = []
+        self._signature = None
+        self.sources = SourceStore(self.wiki_dir)
+        self.summaries = SummaryStore(self.wiki_dir)
+        self.related_summaries: dict[str, list[str]] = {}
 
     def load(self) -> None:
-        """Walk the wiki directory and build all indices (idempotent)."""
-        if self._loaded:
+        # stat snapshots include untracked files, deletions and new directories.
+        files = sorted(p for p in self.wiki_dir.rglob('*')
+                       if not any(x.startswith('.') for x in p.relative_to(self.wiki_dir).parts)
+                       and not p.is_symlink())
+        files = [p for p in files if p.resolve().is_relative_to(self.wiki_dir.resolve())]
+        signature = tuple((str(p), p.stat().st_mtime_ns, p.stat().st_size) for p in files)
+        if signature == self._signature:
             return
-        if not self.wiki_dir.exists():
-            _logger.warning("wiki dir does not exist: %s", self.wiki_dir)
-            self._loaded = True
-            return
-
-        for md in self.wiki_dir.rglob("*.md"):
-            rel = md.relative_to(self.wiki_dir)
-            rel_str = str(rel)
-
-            if md.name in ("index.md", "overview.md", "log.md"):
-                continue
-
-            if md.name == "_index.md":
-                dir_name = str(rel.parent) if str(rel.parent) != "." else ""
-                if dir_name:
-                    try:
-                        self.dir_indexes[dir_name] = md.read_text(encoding="utf-8")
-                    except (OSError, UnicodeDecodeError):
-                        pass
-                continue
-
+        self.pages, self.dir_indexes, self.directories, self.errors = {}, {}, {}, []
+        descriptions = {}
+        registry = self.wiki_dir / 'page_types.yaml'
+        if registry.is_file():
             try:
-                text = md.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
+                descriptions = (yaml.safe_load(registry.read_text()) or {}).get('page_types', {})
+            except (ValueError, yaml.YAMLError, AttributeError):
+                pass
+        for path in files:
+            rel = path.relative_to(self.wiki_dir).as_posix()
+            if path.is_dir():
+                info = descriptions.get(rel, {})
+                self.directories[rel] = info.get('description', rel.rsplit('/', 1)[-1]) if isinstance(info, dict) else str(info)
                 continue
-
-            page = self._parse_page(md.stem, rel, text)
-            self.pages[rel_str] = page
-
+            if path.suffix != '.md' or path.name in ('index.md', 'overview.md', 'log.md'):
+                continue
+            text = path.read_bytes().decode('utf-8')
+            if path.name == '_index.md':
+                self.dir_indexes[str(Path(rel).parent)] = text
+                continue
+            try:
+                page = self._parse_page(path.stem, Path(rel), text)
+                self.pages[rel] = page
+            except (ValueError, TypeError, KeyError, yaml.YAMLError) as exc:
+                # Broken metadata must not make the original body inaccessible.
+                self.errors.append({'path': rel, 'error': str(exc)})
+                self.pages[rel] = WikiPage(path.stem, str(Path(rel).parent), rel, text, text)
+        self.related_summaries = {}
+        for rp, page in self.pages.items():
+            if page.metadata.get('type') == 'cross_document_summary' and page.metadata.get('summary_status') == 'current':
+                for child in page.links_to:
+                    self.related_summaries.setdefault(child, []).append(rp)
         self._build_bm25()
-        self._loaded = True
-        _logger.info(
-            "loaded wiki: %d pages, %d directory indices",
-            len(self.pages), len(self.dir_indexes),
-        )
+        self._signature = signature
 
     def _parse_page(self, stem: str, rel: Path, text: str) -> WikiPage:
-        dir_name = str(rel.parent) if str(rel.parent) != "." else ""
-
-        aliases: list[str] = []
-        tags: list[str] = []
-        description = ""
-        body = text
-
-        fm = re.match(r"^---\s*\n(.*?)\n---\s*\n", text, re.DOTALL)
-        if fm:
-            body = text[fm.end():]
-            block = fm.group(1)
-            am = re.search(r"aliases:\s*\[(.+?)\]", block)
-            if am:
-                aliases = [a.strip().strip("'\"") for a in am.group(1).split(",") if a.strip()]
-            tm = re.search(r"tags:\s*\[(.+?)\]", block)
-            if tm:
-                tags = [t.strip().strip("'\"") for t in tm.group(1).split(",") if t.strip()]
-
-        for line in body.strip().split("\n"):
-            line = line.strip()
-            if line.startswith("> ") and not line.startswith("> Source"):
-                description = line[2:].strip()
-                break
-
-        links_to = re.findall(r"\[\[(.+?)\]\]", body)
-
-        return WikiPage(
-            name=stem,
-            dir_name=dir_name,
-            rel_path=str(rel),
-            text=text,
-            body=body,
-            aliases=aliases,
-            tags=tags,
-            description=description,
-            links_to=links_to,
-        )
-
-    # ── BM25 ──────────────────────────────────────────────────────────────
-
-    @classmethod
-    def _tokenize(cls, text: str) -> list[str]:
-        """ASCII tokenizer (lowercase, ≥2 chars). Suitable for English corpora."""
-        return [m.group() for m in cls._TOKEN_RE.finditer(text.lower()) if len(m.group()) >= 2]
-
-    def _build_bm25(self) -> None:
-        inv: dict[str, dict[str, int]] = {}
-        doc_len: dict[str, int] = {}
-        total = 0
-        for rp, page in self.pages.items():
-            doc_text = f"{page.name.replace('-', ' ')} {page.description} {page.body}"
-            toks = self._tokenize(doc_text)
-            doc_len[rp] = len(toks)
-            total += len(toks)
-            for tok, tf in Counter(toks).items():
-                inv.setdefault(tok, {})[rp] = tf
-        self._inv = inv
-        self._doc_len = doc_len
-        self._avg_dl = total / len(self.pages) if self.pages else 1.0
-        N = len(self.pages)
-        self._idf = {
-            tok: math.log((N - len(post) + 0.5) / (len(post) + 0.5) + 1.0)
-            for tok, post in inv.items()
-        }
-
-    def _bm25_score(self, query_tokens: Iterable[str]) -> dict[str, float]:
-        scores: dict[str, float] = {}
-        k1, b, avgdl = self._BM25_K1, self._BM25_B, self._avg_dl
-        for tok in query_tokens:
-            idf = self._idf.get(tok, 0.0)
-            if idf <= 0:
-                continue
-            postings = self._inv.get(tok)
-            if not postings:
-                continue
-            for rp, tf in postings.items():
-                dl = self._doc_len.get(rp, 0)
-                num = tf * (k1 + 1)
-                den = tf + k1 * (1 - b + b * dl / avgdl)
-                scores[rp] = scores.get(rp, 0.0) + idf * num / den
-        return scores
-
-    # ── search ────────────────────────────────────────────────────────────
-
-    def search(self, query: str, limit: int = 10) -> list[SearchResult]:
-        """Search by structured fields first, then fall back to page content (BM25)."""
-        self.load()
-        query = (query or "").strip()
-        if not query:
-            return []
-
-        sub_words = [w for w in query.split() if w]
-        bm25 = self._bm25_score(self._tokenize(query))
-
-        results: list[SearchResult] = []
-        scored_paths: set[str] = set()
-
-        for rp, page in self.pages.items():
-            total = 0.0
-            matched: set[str] = set()
-            for w in sub_words:
-                s, fields = self._score_word(w, page)
-                if s > 0:
-                    total += s
-                    matched.update(fields)
-
-            bm25_s = bm25.get(rp, 0.0)
-            if bm25_s > 0:
-                total += min(bm25_s * self._BM25_WEIGHT, self._BM25_CAP)
-                matched.add("content")
-
-            if total > 0:
-                results.append(SearchResult(page=page, score=total, matched_fields=sorted(matched)))
-                scored_paths.add(rp)
-
-        # BM25-only hits (no structured match)
-        for rp, bm25_s in bm25.items():
-            if rp in scored_paths or bm25_s <= 0:
-                continue
-            page = self.pages.get(rp)
-            if page is None:
-                continue
-            results.append(SearchResult(
-                page=page,
-                score=min(bm25_s * self._BM25_WEIGHT, self._BM25_CAP),
-                matched_fields=["content"],
-            ))
-
-        results.sort(key=lambda r: r.score, reverse=True)
-        return results[:limit]
+        meta, body = frontmatter(text)
+        if rel.as_posix().startswith('summaries/'):
+            state, _ = self.summaries.get(rel.as_posix())
+            reasons = self.summaries.freshness(state)
+            body = summary_text(state) if not reasons else ''
+            meta = {**meta, 'type': 'cross_document_summary', 'level': 1, 'title': state['title'],
+                    'description': body, 'summary_status': 'stale' if reasons else 'current'}
+            return WikiPage(state['title'], str(rel.parent), rel.as_posix(), text, body,
+                            description=body, links_to=[c['path'] for c in state['children']], metadata=meta)
+        if rel.as_posix().startswith('sources/versions/'):
+            sidecar = self.wiki_dir / rel.with_suffix('.json')
+            if sidecar.is_file():
+                meta = {**meta, **json.loads(sidecar.read_bytes().decode('utf-8'))}
+        def strings(key):
+            value = meta.get(key, [])
+            return [str(x) for x in value] if isinstance(value, list) else [str(value)] if value else []
+        description = str(meta.get('description', ''))
+        if not description:
+            description = next((line[2:] for line in body.splitlines() if line.startswith('> ')), '')
+        state = fact_state(text)
+        links = [x.split('|')[0].split('#')[0] for x in re.findall(r'\[\[(.*?)\]\]', body)]
+        links += state.get('links', [])
+        return WikiPage(str(meta.get('title') or meta.get('source_title') or stem), str(rel.parent), rel.as_posix(), text, body,
+                        strings('aliases'), strings('tags'), description, list(dict.fromkeys(links)), meta)
 
     @staticmethod
-    def _score_word(word: str, page: WikiPage) -> tuple[float, set[str]]:
-        """Score a single sub-token against one page (highest field wins)."""
-        w = word.lower()
-        best_score = 0.0
-        best_field: str | None = None
+    def _tokenize(text: str) -> list[str]:
+        return re.findall(r'[^\W_]+', text.casefold(), re.UNICODE)
 
-        # name
-        name = page.name.lower()
-        name_norm = name.replace("-", " ")
-        if w == name or w == name_norm:
-            best_score, best_field = 100.0, "name"
-        elif w in name or w in name_norm:
-            best_score, best_field = 80.0, "name"
+    @classmethod
+    def _entity_key(cls, text: str) -> str:
+        return ' '.join(cls._tokenize(text.replace('-', ' ')))
 
-        # aliases
-        for alias in page.aliases:
-            al = alias.lower()
-            if w == al and 90.0 > best_score:
-                best_score, best_field = 90.0, "aliases"
-                break
-            if w in al and 70.0 > best_score:
-                best_score, best_field = 70.0, "aliases"
+    def _build_bm25(self):
+        self._inv, self._doc_len = {}, {}
+        for rp, page in self.pages.items():
+            if rp.startswith('summaries/') and page.metadata.get('summary_status') != 'current':
+                continue
+            # Index readable statements, not hashes, JSON keys or repeated quoted evidence.
+            from_block = fact_state(page.text) if '<!-- wiki-facts:start -->' in page.text and not any(e['path'] == rp for e in self.errors) else {}
+            body = re.sub(r'<!-- wiki-facts:start -->.*?<!-- wiki-facts:end -->', '', page.body, flags=re.S)
+            body += ' '.join(f['statement'] for f in from_block.get('facts', []))
+            tokens = self._tokenize(' '.join([page.name, *page.aliases, *page.tags, page.description, body]))
+            self._doc_len[rp] = len(tokens)
+            for word, tf in Counter(tokens).items():
+                self._inv.setdefault(word, {})[rp] = tf
+        self._avg_dl = max(1, sum(self._doc_len.values()) / max(1, len(self.pages)))
 
-        # tags
-        for tag in page.tags:
-            tl = tag.lower()
-            if (w == tl or w in tl) and 50.0 > best_score:
-                best_score, best_field = 50.0, "tags"
-                break
+    def _bm25_score(self, query_tokens):
+        scores = {}
+        for token in set(query_tokens):
+            postings = self._inv.get(token, {})
+            idf = math.log(1 + (len(self.pages) - len(postings) + .5) / (len(postings) + .5))
+            for rp, tf in postings.items():
+                scores[rp] = scores.get(rp, 0) + idf * tf * 2.2 / (tf + 1.2 * (.25 + .75 * self._doc_len[rp] / self._avg_dl))
+        return scores
 
-        # description
-        if page.description and w in page.description.lower() and 40.0 > best_score:
-            best_score, best_field = 40.0, "description"
-
-        return best_score, ({best_field} if best_field else set())
-
-    # ── read ──────────────────────────────────────────────────────────────
-
-    def read(self, paths: list[str]) -> list[dict]:
-        """Batch-read directory indices or page files.
-
-        * `"/"`            → list of available top-level directories
-        * `"entities"`     → directory `_index.md` (or page list)
-        * `"entities/X.md"` → full page text + metadata
-        """
+    def search(self, query: str, limit: int = 10, directory: str = '', mode: str | None = None,
+               layer: str = 'all') -> list[SearchResult]:
         self.load()
-        out: list[dict] = []
-        for raw in paths:
-            p = (raw or "").strip()
-            if p == "/":
-                out.append({"path": "/", "type": "root", "dirs": sorted(self.dir_indexes.keys())})
+        if layer not in ('all', 'summaries', 'details'):
+            raise ValueError('search layer must be all, summaries or details')
+        if not isinstance(limit, int) or not 1 <= limit <= 50:
+            raise ValueError('limit must be 1..50')
+        mode = mode or self.search_mode
+        if mode not in ('bm25', 'exact', 'exact_then_bm25'):
+            raise ValueError('invalid search mode')
+        query_key = self._entity_key(query)
+        if not query_key:
+            return []
+        scores = self._bm25_score(self._tokenize(query))
+        results = []
+        for rp, page in self.pages.items():
+            is_summary = rp.startswith('summaries/')
+            if is_summary and page.metadata.get('summary_status') != 'current':
                 continue
-
-            if p.endswith(".md"):
-                page = self.pages.get(p)
-                if page is None:
-                    out.append({"path": p, "type": "error", "error": "not found"})
-                    continue
-                out.append({
-                    "path": p,
-                    "type": "file",
-                    "name": page.name,
-                    "text": page.text,
-                    "meta": {
-                        "aliases": page.aliases,
-                        "tags": page.tags,
-                        "description": page.description,
-                        "links_to": page.links_to,
-                    },
-                })
+            if (layer == 'summaries' and not is_summary) or (layer == 'details' and is_summary):
                 continue
-
-            # directory
-            idx = self.dir_indexes.get(p)
-            if idx:
-                out.append({"path": p, "type": "directory", "name": p, "text": idx})
+            if directory and not rp.startswith(directory.rstrip('/') + '/'):
                 continue
+            exact = query_key in {self._entity_key(x) for x in [page.name, *page.aliases]}
+            if mode == 'exact' and not exact:
+                continue
+            if exact or scores.get(rp, 0) > 0:
+                results.append(SearchResult(page, scores.get(rp, 0), ['exact_entity'] if exact else ['bm25']))
+        results.sort(key=lambda r: ((mode != 'bm25' and 'exact_entity' in r.matched_fields), r.score, r.page.rel_path), reverse=True)
+        # Collapse copies of the SAME source version only; never collapse entities by title.
+        seen, unique = set(), []
+        for result in results:
+            page = result.page
+            key = ('source', digest(page.text)) if page.rel_path.startswith('sources/') else ('page', page.rel_path)
+            if key not in seen:
+                unique.append(result)
+                seen.add(key)
+        if self.reranker and mode != 'exact':
+            unique = self.reranker(query, unique)
+        return unique[:limit]
 
-            prefix = p + "/"
-            pages_in_dir = [pg.name for rel, pg in self.pages.items() if rel.startswith(prefix)]
-            if pages_in_dir:
-                out.append({"path": p, "type": "directory", "name": p, "pages": pages_in_dir})
-            else:
-                out.append({"path": p, "type": "error", "error": "not found"})
-        return out
-
-    # ── helpers ───────────────────────────────────────────────────────────
+    def tree(self) -> dict:
+        self.load()
+        return {'directories': [{'path': d, 'description': desc,
+                                 'page_count': sum(p.dir_name == d for p in self.pages.values())}
+                                for d, desc in sorted(self.directories.items())],
+                'root_pages': [p.rel_path for p in self.pages.values() if p.dir_name == '.'],
+                'parse_errors': self.errors,
+                'summary_layer': {'levels': 1, 'current': sum(p.metadata.get('summary_status') == 'current' for p in self.pages.values()),
+                                  'stale': sum(p.metadata.get('summary_status') == 'stale' for p in self.pages.values()),
+                                  'read_tool': 'summary_read: overview -> claims -> evidence -> source_read'}}
 
     def wiki_map(self) -> str:
-        """A short, agent-facing overview of the Wiki layout."""
-        self.load()
-        counts: dict[str, int] = {}
-        for page in self.pages.values():
-            counts[page.dir_name] = counts.get(page.dir_name, 0) + 1
-        lines = ["# Wiki Map\n"]
-        for d in sorted(counts):
-            lines.append(f"- **{d or '/'}/** ({counts[d]} pages)")
-            idx = self.dir_indexes.get(d, "")
-            if idx:
-                entries = re.findall(r"\[\[(.+?)\]\]", idx)
-                for e in entries[:5]:
-                    lines.append(f"  - {e}")
-                if len(entries) > 5:
-                    lines.append(f"  - ... ({len(entries) - 5} more)")
-        return "\n".join(lines)
+        # All actual directories, no sampled index entries or hard-coded topic selection.
+        tree = self.tree()
+        return json.dumps(tree, ensure_ascii=False)
 
-    # ── tool dispatch (matches paper tool names) ──────────────────────────
+    def read(self, paths: list[str], section: str | None = None, start: int = 0,
+             length: int = 6000, view: str = 'text', page_limit: int = 50) -> list[dict]:
+        self.load()
+        if not isinstance(paths, list) or not 1 <= len(paths) <= 15:
+            raise ValueError('read 1..15 paths per call')
+        if not isinstance(start, int) or start < 0 or not isinstance(length, int) or not 1 <= length <= 12000:
+            raise ValueError('invalid read window')
+        if not isinstance(page_limit, int) or not 1 <= page_limit <= 200:
+            raise ValueError('page_limit must be 1..200')
+        out = []
+        for raw in paths:
+            if raw == '/':
+                out.append({'path': '/', 'type': 'root', **self.tree()})
+                continue
+            raw = raw.split('|', 1)[0].split('#', 1)[0]
+            if raw.endswith('/_index.md'):
+                raw = raw.removesuffix('/_index.md')
+            path = safe_path(self.wiki_dir, raw)
+            if not path.exists() and not raw.endswith('.md'):
+                path = safe_path(self.wiki_dir, raw + '.md')
+            rp = path.relative_to(self.wiki_dir.resolve()).as_posix()
+            if path.is_dir():
+                pages = [{'path': p.rel_path, 'name': p.name, 'description': p.description,
+                          **({'summary_status': p.metadata['summary_status']} if 'summary_status' in p.metadata else {})}
+                         for p in self.pages.values() if p.dir_name == rp]
+                end = min(start + page_limit, len(pages))
+                out.append({'path': rp, 'type': 'directory',
+                            'directories': [d for d in self.directories if str(Path(d).parent) == rp],
+                            'pages': pages[start:end], 'start': start, 'end': end, 'total_pages': len(pages),
+                            'next_start': end if end < len(pages) else None})
+                continue
+            page = self.pages.get(rp)
+            if not page:
+                out.append({'path': rp, 'error': 'not found', 'type': 'error'})
+                continue
+            text = page.text
+            extra = {}
+            if rp.startswith('summaries/'):
+                revealed = self.summaries.read(rp)
+                text = revealed['text']
+                extra = {'summary_status': revealed['status'], 'stale_reasons': revealed['stale_reasons'],
+                         'next_tool': {'name': 'summary_read', 'arguments': {'path': rp, 'view': 'claims'}}}
+            elif view == 'summary':
+                state = fact_state(text)
+                superseded = {fid for f in state['facts'] for fid in f.get('supersedes', [])}
+                summaries = [f['statement'] for f in state['facts'] if f['kind'] == 'summary' and f['id'] not in superseded]
+                text = '\n'.join(summaries) or page.description
+            elif view in ('facts', 'relations'):
+                state = fact_state(text)
+                selected = state['facts'] if view == 'facts' else [f for f in state['facts'] if f['kind'] == 'relation']
+                text = json.dumps(selected, ensure_ascii=False)
+            elif view != 'text':
+                raise ValueError('unknown view')
+            if section:
+                lines = text.splitlines(keepends=True)
+                headings = [(i, len(m[1]), m[2].strip()) for i, line in enumerate(lines)
+                            if (m := re.match(r'^(#{1,6})\s+(.+?)\s*$', line))]
+                matches = [(i, level) for i, level, name in headings if name.casefold() == section.casefold()]
+                if len(matches) != 1:
+                    out.append({'path': rp, 'type': 'error', 'error': 'section missing or ambiguous'})
+                    continue
+                i, level = matches[0]
+                end_line = next((j for j, lev, _ in headings if j > i and lev <= level), len(lines))
+                text = ''.join(lines[i:end_line])
+            end = min(start + length, len(text))
+            if start > len(text):
+                raise ValueError('offset exceeds selected content')
+            out.append({'path': rp, 'type': 'file', 'name': page.name, 'revision': digest(page.text),
+                        'text': text[start:end], 'start': start, 'end': end, 'length': len(text),
+                        'next_start': end if end < len(text) else None,
+                        'meta': {**page.metadata, 'links_to': page.links_to}, 'source_refs': self._source_refs(page),
+                        'related_summaries': self.related_summaries.get(rp, []), 'view': view, 'section': section, **extra})
+        return out
+
+    def _source_refs(self, page: WikiPage) -> list[dict]:
+        refs = []
+        candidates = [page.rel_path] if page.rel_path.startswith(('sources/articles/', 'sources/versions/')) else []
+        article = page.metadata.get('source_article')
+        if isinstance(article, str):
+            candidates.append('sources/articles/' + article.removesuffix('.md') + '.md')
+        candidates += [link if link.endswith('.md') else link + '.md' for link in page.links_to
+                       if link.startswith(('sources/articles/', 'sources/versions/'))]
+        for relative in dict.fromkeys(candidates):
+            try:
+                target = safe_path(self.wiki_dir, relative)
+                if not target.is_file():
+                    continue
+                if relative.startswith('sources/versions/'):
+                    ref = json.loads(target.with_suffix('.json').read_bytes().decode('utf-8'))
+                    self.sources.get(ref['source_id'], ref['version_id'])
+                else:
+                    original = target.read_bytes().decode('utf-8')
+                    ref = self.sources.archive(target.as_uri(), original, self.pages[relative].name if relative in self.pages else target.stem)
+                refs.append(ref)
+            except (OSError, ValueError, KeyError):
+                continue
+        return refs
 
     def execute_tool(self, name: str, arguments: dict) -> str:
-        """Run a single tool call and return a JSON string."""
-        if name == "wiki_search":
-            results = self.search(
-                arguments.get("query", ""),
-                limit=min(int(arguments.get("limit", 10)), 50),
-            )
-            payload = {
-                "matched": len(results),
-                "results": [
-                    {
-                        "path": r.page.rel_path,
-                        "name": r.page.name,
-                        "score": round(r.score, 3),
-                        "matched_fields": r.matched_fields,
-                        "meta": {
-                            "aliases": r.page.aliases,
-                            "tags": r.page.tags,
-                            "description": r.page.description,
-                        },
-                    }
-                    for r in results
-                ],
-            }
-            return json.dumps(payload, ensure_ascii=False)
-
-        if name == "wiki_read":
-            return json.dumps(self.read(arguments.get("paths") or arguments.get("dirs") or []),
-                              ensure_ascii=False)
-
-        return json.dumps({"error": f"unknown tool: {name}"})
+        try:
+            if not isinstance(arguments, dict):
+                raise ValueError('tool arguments must be an object')
+            if name in ('wiki_search', 'entity_lookup'):
+                args = dict(arguments)
+                if name == 'entity_lookup':
+                    args['mode'] = 'exact'
+                results = self.search(**args)
+                payload = {'matched': len(results), 'results': [
+                    {'path': r.page.rel_path, 'name': r.page.name, 'score': r.score,
+                     'matched_fields': r.matched_fields,
+                     'meta': {**r.page.metadata, 'description': r.page.description}} for r in results]}
+            elif name == 'wiki_read':
+                payload = self.read(**arguments)
+            elif name == 'wiki_tree':
+                payload = self.tree()
+            elif name == 'source_read':
+                payload = self.sources.read(**arguments)
+            elif name == 'summary_read':
+                payload = self.summaries.read(**arguments)
+            else:
+                raise ValueError(f'unknown tool: {name}')
+        except (OSError, ValueError, TypeError, KeyError, yaml.YAMLError) as exc:
+            payload = {'error': str(exc)}
+        return json.dumps(payload, ensure_ascii=False)
 
 
-# ─── OpenAI tool schemas exposed to the agent ─────────────────────────────
+def tool_schema(name, description, properties, required=()):
+    return {'type': 'function', 'function': {'name': name, 'description': description,
+            'parameters': {'type': 'object', 'properties': properties, 'required': list(required), 'additionalProperties': False}}}
 
-WIKI_TOOL_SCHEMAS: list[dict] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "wiki_search",
-            "description": (
-                "Search the Wiki index by prioritizing structured signals such as page "
-                "names, aliases, tags, and descriptions before falling back to page "
-                "content. Returns candidate pages and metadata only (no body text)."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query."},
-                    "limit": {"type": "integer", "description": "Max results to return (default 10)."},
-                },
-                "required": ["query"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "wiki_read",
-            "description": (
-                "Batch-read directory indices (_index.md) or full pages. For knowledge "
-                "pages, the returned content includes inter-page wikilinks that serve "
-                "as traversal affordances for subsequent hops."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "paths": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": (
-                            "List of paths. Use '/' for the root, 'entities' for a "
-                            "directory index, 'entities/X.md' for a full page."
-                        ),
-                    }
-                },
-                "required": ["paths"],
-            },
-        },
-    },
+S = {'type': 'string'}
+I = {'type': 'integer'}
+STRINGS = {'type': 'array', 'items': S}
+CITATION = {'type': 'object', 'properties': {'source_id': S, 'version_id': S, 'start': I, 'end': I, 'quote': S},
+            'required': ['source_id', 'version_id', 'start', 'end', 'quote'], 'additionalProperties': False}
+WIKI_TOOL_SCHEMAS = [
+    tool_schema('wiki_tree', 'Show every live directory and description, including uncommitted files.', {}),
+    tool_schema('wiki_search', 'BM25 candidate search, metadata only. Change queries/directories if evidence is missing.',
+                {'query': S, 'limit': I, 'directory': S, 'mode': {'enum': ['bm25', 'exact_then_bm25']},
+                 'layer': {'enum': ['all', 'summaries', 'details']}}, ['query']),
+    tool_schema('entity_lookup', 'Exact full name/alias lookup; multiple matches need disambiguation.', {'query': S, 'limit': I, 'directory': S}, ['query']),
+    tool_schema('wiki_read', 'Browse directories or read a page/view/section in windows. Follow next_start until done when needed.',
+                {'paths': STRINGS, 'section': S, 'start': I, 'length': I, 'page_limit': I, 'view': {'enum': ['text', 'summary', 'facts', 'relations']}}, ['paths']),
+    tool_schema('source_read', 'Read immutable original evidence by source/version IDs and Unicode character offsets; next_start exposes the rest.',
+                {'source_id': S, 'version_id': S, 'start': I, 'length': I}, ['source_id', 'version_id']),
+    tool_schema('summary_read', 'Progressively reveal a cross-document summary: overview, claim map, then evidence for ONE claim_id per call. Stale summaries only return child navigation. Read originals with source_read before answering.',
+                {'path': S, 'view': {'enum': ['overview', 'claims', 'evidence']}, 'claim_ids': STRINGS}, ['path']),
 ]

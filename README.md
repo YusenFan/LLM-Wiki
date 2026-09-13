@@ -34,7 +34,13 @@ release/
 │   ├── llm_client.py         # OpenAI-compatible API client (chat + tool calls)
 │   ├── download_datasets.py  # download public dev sets
 │   ├── preprocess_bench.py   # raw paragraphs → Markdown articles
-│   ├── bench_ingest.py       # two-step LLM ingestion engine
+│   ├── bench_ingest.py       # tool-driven ingestion entry point (legacy helpers retained)
+│   ├── build_agent.py        # document build loop and validated receipts
+│   ├── build_summaries.py    # one cross-document summary layer over cited facts
+│   ├── summary_store.py      # summary dependencies, provenance and progressive reads
+│   ├── wiki_store.py         # immutable sources and atomic fact increments
+│   ├── validate_wiki.py      # deterministic repair, backups, integrity audit
+│   ├── retrieval_experiment.py # BM25 / entity candidate comparison
 │   ├── bench_error_book.py   # error book for self-correction
 │   ├── run.py                # offline wiki construction runner
 │   ├── wiki_retriever.py     # wiki_search + wiki_read tools
@@ -85,9 +91,13 @@ Once a wiki has been compiled, the agent can traverse it to answer questions.
 The agent composes `wiki_search` and `wiki_read` calls, follows wikilinks,
 and checks evidence sufficiency before producing a final answer.
 
-Paper-faithful defaults: tool-call budget `T_max = 15`, patience
-`P = 3` consecutive empty searches, and at most `k = 5` pages selected per
-search.
+The premium Answer Agent owns both exploration and final answering in one context.
+Defaults: 30 evidence/tool calls, no sub-agents, and 5 candidates per search.
+For cross-document questions it can progressively reveal summary overviews, claims,
+selected fact evidence, and original sources. Precise questions can search details directly.
+A final synthesis call can follow exhausted evidence budget. The legacy `--patience`
+flag is retained for CLI compatibility; empty searches no longer prematurely stop
+exploration across other directories. This changes the original paper protocol.
 
 ```bash
 # 1. Generate predictions (one JSONL line per question).
@@ -121,6 +131,88 @@ config.ensure_wiki_dirs()
 article_paths = sorted(config.RAW_DIR.glob("*.md"))
 bench_ingest.ingest_batch(article_paths, batch_size=3)
 ```
+
+## Tool-driven architecture and migration
+
+The implementation follows [WIKI_AGENT_PLAN.md](WIKI_AGENT_PLAN.md).
+See [schema and tool contracts](configs/wiki-schema.md) and
+[acceptance checks](docs/wiki-agent-acceptance.md).
+
+- Full source text is archived by explicit origin identity and immutable content version.
+- The builder sees the actual filesystem tree, reads source windows, finds existing
+  entities, and submits revision-checked fact increments with verified quotations.
+- Old prose and unrelated facts survive updates. Conflicts and superseded claims
+  remain inspectable. Directory categories grow from content; sampling is disabled.
+- Each document has a validated receipt. Failed/partial builds are retried; old SHA-only
+  caches are ignored. `--batch-size` is retained but documents now build independently.
+- The premium Answer Agent continues requesting evidence until it can answer or report
+  a gap. Final prediction JSONL retains the short answer alongside citations, reasoning,
+  evidence gaps, tool trace, timing, calls and per-model token usage.
+
+Additional configuration: `INGEST_TOOL_BUDGET=40` controls builder calls per document.
+`SUMMARY_BUILD_LIMIT=20` bounds summary-generation calls after each ingestion batch;
+0 disables that phase. `--answer-model` selects the single exploring/answering model
+(premium by default). `--retrieval-model` and `--no-subtasks` are deprecated compatibility
+flags; CLI QA never enables delegation. `--search-mode bm25|exact_then_bm25` and `--select-pages 5|10|15`
+allow controlled comparisons. Optional rerankers are Python callbacks on `WikiRetriever`;
+no embedding service is required. Model-provided token counts are recorded; dollar
+cost depends on your provider's prices and is not inferred.
+
+Repair existing output with backups, then audit it:
+
+```bash
+python -m llm_wiki_bench.validate_wiki \
+  --wiki-dir wiki_output/hotpotqa/wiki --repair \
+  --output results/hotpotqa/wiki-repair.json
+
+python -m llm_wiki_bench.validate_wiki \
+  --wiki-dir wiki_output/hotpotqa/wiki \
+  --output results/hotpotqa/wiki-audit.json
+```
+
+Repair unwraps whole-page Markdown fences, quotes malformed metadata where the
+value is unambiguous, resolves unique exact bare links, and snapshots legacy originals.
+Backups live in `wiki/.repair-backups/`. Missing/ambiguous links are reported, never
+invented. Legacy prose is still unverified until rebuilt with source-backed facts;
+archiving cannot recover text that an earlier pipeline never saved. Rerun preprocessing
+from the original dataset to retain previously discarded same-title variants.
+
+Run offline protocol regressions and candidate recall comparisons:
+
+```bash
+python -m unittest discover -s tests -v
+python -m llm_wiki_bench.retrieval_experiment \
+  --wiki-dir wiki_output/hotpotqa/wiki --qa data/hotpotqa/qa_pairs.jsonl \
+  --limit 50 --output results/hotpotqa/retrieval-baseline.json
+```
+
+Candidate supporting-title coverage is a retrieval proxy, not a source entailment or
+answer-quality score. Live model runs are required to select the search algorithm,
+Agent topology and budgets on measured answer quality and cost. Exact quotation
+validation establishes source identity/location, not that the quotation logically
+supports every generated claim; that remains a model/review evaluation requirement.
+
+## Cross-document summaries
+
+Ingestion now compiles one summary layer from current, source-backed facts on related
+knowledge pages. Each claim links to its supporting facts and exact originals.
+Changed dependencies invalidate summaries until rebuilt; stale summaries cannot be
+used as final references. This borrows the iterative QA idea from Ψ-RAG, without
+implementing its full embedding-based tree or adding another QA agent.
+
+Inspect eligibility, then build or resume pending groups:
+
+```bash
+python -m llm_wiki_bench.build_summaries \
+  --wiki-dir wiki_output/hotpotqa/wiki --dry-run
+python -m llm_wiki_bench.build_summaries \
+  --wiki-dir wiki_output/hotpotqa/wiki --limit 20 \
+  --output results/hotpotqa/summary-build.json
+```
+
+Uncited legacy prose is ineligible: rebuild it through the normal ingestion entry
+point first. The compiler reports pending groups, skipped unrelated pairs, failures,
+and model usage. See [design, operation and limits](docs/cross-document-summaries.md).
 
 ## Citation
 

@@ -18,6 +18,8 @@ Usage:
     python preprocess_bench.py --dataset hotpotqa --limit 500
 """
 
+import hashlib
+import yaml
 import argparse
 import json
 import re
@@ -43,6 +45,26 @@ def sanitize_filename(name: str) -> str:
     return name[:200] if name else "untitled"
 
 
+def _write_articles(paragraphs: dict, output_dir: Path, dataset: str) -> int:
+    """Preserve all title/text variants; source identity is separate from version.
+
+    Wikipedia title identifies a source in this dataset, never a Wiki entity.
+    Hash suffixes prevent collisions from filename sanitization and title truncation.
+    """
+    articles_dir = output_dir / "articles"
+    articles_dir.mkdir(parents=True, exist_ok=True)
+    for (title, text) in paragraphs:
+        identity = f"{dataset}:wikipedia:{title}"
+        sid = hashlib.sha256(identity.encode()).hexdigest()
+        version = hashlib.sha256(text.encode()).hexdigest()
+        metadata = {"source_identity": identity, "source_id": sid,
+                    "source_type": "wikipedia", "title": title, "dataset": dataset}
+        content = "---\n" + yaml.safe_dump(metadata, allow_unicode=True, sort_keys=False) + "---\n\n# " + title + "\n\n" + text + "\n"
+        path = articles_dir / f"{sanitize_filename(title)[:100]}--{sid[:16]}--{version[:16]}.md"
+        path.write_text(content, encoding="utf-8")
+    return len(paragraphs)
+
+
 def process_hotpotqa(input_path: Path, output_dir: Path, data_dir: Path,
                      limit: int = None) -> dict:
     """Process the HotpotQA distractor dev set.
@@ -65,7 +87,7 @@ def process_hotpotqa(input_path: Path, output_dir: Path, data_dir: Path,
         data = data[:limit]
         print(f"  🔢 Limiting to first {limit} QA items")
 
-    # Collect all unique paragraphs (deduplicated by title).
+    # Collect all unique paragraphs (deduplicated by exact title and text).
     paragraphs = {}  # title -> full_text
     qa_pairs = []
 
@@ -76,9 +98,8 @@ def process_hotpotqa(input_path: Path, output_dir: Path, data_dir: Path,
 
         # Extract context paragraphs.
         for title, sentences in item.get("context", []):
-            if title not in paragraphs:
-                full_text = " ".join(sentences)
-                paragraphs[title] = full_text
+            full_text = " ".join(sentences)
+            paragraphs[(title, full_text)] = True
 
         qa_pairs.append({
             "id": item.get("_id", ""),
@@ -89,29 +110,7 @@ def process_hotpotqa(input_path: Path, output_dir: Path, data_dir: Path,
             "supporting_titles": supporting_titles,
         })
 
-    # Write Markdown articles.
-    articles_dir = output_dir / "articles"
-    articles_dir.mkdir(parents=True, exist_ok=True)
-
-    written = 0
-    for title, text in paragraphs.items():
-        filename = sanitize_filename(title) + ".md"
-        filepath = articles_dir / filename
-
-        escaped_title = title.replace('"', '\\"')
-        md_content = f"""---
-source_id: {sanitize_filename(title)}
-source_type: wikipedia
-title: "{escaped_title}"
-dataset: hotpotqa
----
-
-# {title}
-
-{text}
-"""
-        filepath.write_text(md_content, encoding="utf-8")
-        written += 1
+    written = _write_articles(paragraphs, output_dir, "hotpotqa")
 
     # Write QA pairs.
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -123,7 +122,7 @@ dataset: hotpotqa
     return {
         "qa_count": len(qa_pairs),
         "paragraph_count": written,
-        "unique_titles": len(paragraphs),
+        "unique_titles": len({title for title, _ in paragraphs}),
     }
 
 
@@ -175,8 +174,7 @@ def process_musique(input_path: Path, output_dir: Path, data_dir: Path,
         for para in item.get("paragraphs", []):
             title = para["title"]
             text = para["paragraph_text"]
-            if title not in paragraphs:
-                paragraphs[title] = text
+            paragraphs[(title, text)] = True
             if para.get("is_supporting", False):
                 supporting_titles.append(title)
 
@@ -188,29 +186,7 @@ def process_musique(input_path: Path, output_dir: Path, data_dir: Path,
             "supporting_titles": list(set(supporting_titles)),
         })
 
-    # Write Markdown articles.
-    articles_dir = output_dir / "articles"
-    articles_dir.mkdir(parents=True, exist_ok=True)
-
-    written = 0
-    for title, text in paragraphs.items():
-        filename = sanitize_filename(title) + ".md"
-        filepath = articles_dir / filename
-
-        escaped_title = title.replace('"', '\\"')
-        md_content = f"""---
-source_id: {sanitize_filename(title)}
-source_type: wikipedia
-title: "{escaped_title}"
-dataset: musique
----
-
-# {title}
-
-{text}
-"""
-        filepath.write_text(md_content, encoding="utf-8")
-        written += 1
+    written = _write_articles(paragraphs, output_dir, "musique")
 
     # Write QA pairs.
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -222,7 +198,7 @@ dataset: musique
     return {
         "qa_count": len(qa_pairs),
         "paragraph_count": written,
-        "unique_titles": len(paragraphs),
+        "unique_titles": len({title for title, _ in paragraphs}),
     }
 
 
@@ -256,9 +232,8 @@ def process_2wikimhqa(input_path: Path, output_dir: Path, data_dir: Path,
         supporting_titles = list(set(t for t, _ in item.get("supporting_facts", [])))
 
         for title, sentences in item.get("context", []):
-            if title not in paragraphs:
-                full_text = " ".join(sentences)
-                paragraphs[title] = full_text
+            full_text = " ".join(sentences)
+            paragraphs[(title, full_text)] = True
 
         qa_pairs.append({
             "id": item.get("_id", ""),
@@ -268,29 +243,7 @@ def process_2wikimhqa(input_path: Path, output_dir: Path, data_dir: Path,
             "supporting_titles": supporting_titles,
         })
 
-    # Write Markdown articles.
-    articles_dir = output_dir / "articles"
-    articles_dir.mkdir(parents=True, exist_ok=True)
-
-    written = 0
-    for title, text in paragraphs.items():
-        filename = sanitize_filename(title) + ".md"
-        filepath = articles_dir / filename
-
-        escaped_title = title.replace('"', '\\"')
-        md_content = f"""---
-source_id: {sanitize_filename(title)}
-source_type: wikipedia
-title: "{escaped_title}"
-dataset: 2wikimhqa
----
-
-# {title}
-
-{text}
-"""
-        filepath.write_text(md_content, encoding="utf-8")
-        written += 1
+    written = _write_articles(paragraphs, output_dir, "2wikimhqa")
 
     # Write QA pairs.
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -302,7 +255,7 @@ dataset: 2wikimhqa
     return {
         "qa_count": len(qa_pairs),
         "paragraph_count": written,
-        "unique_titles": len(paragraphs),
+        "unique_titles": len({title for title, _ in paragraphs}),
     }
 
 

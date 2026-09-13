@@ -16,7 +16,10 @@ import re
 import time
 import requests
 
-import bench_config as config
+try:
+    from . import bench_config as config
+except ImportError:
+    import bench_config as config
 
 _llm_logger = logging.getLogger("ingest.llm")
 
@@ -198,7 +201,9 @@ def call_llm_with_tools(
             if not resp.text or not resp.text.strip():
                 raise RuntimeError(f"Empty response (status={resp.status_code})")
             data = resp.json()
-            return data["choices"][0]["message"]
+            message = data["choices"][0]["message"]
+            message["_usage"] = data.get("usage", {})
+            return message
         except (requests.RequestException, KeyError, IndexError,
                 json.JSONDecodeError, RuntimeError) as e:
             if attempt < MAX_RETRIES - 1:

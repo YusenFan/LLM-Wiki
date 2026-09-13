@@ -1,124 +1,117 @@
-# Wiki Schema — Structured Knowledge Base
+# Wiki schema: tool-driven compilation
 
-## Directory layout
+Directories grow from actual content. `page_types.yaml` is an optional description
+registry, not a mandatory taxonomy. No article sampling defines categories.
+The live tree includes all actual directories, including uncommitted files.
 
-Page types are declared in `wiki/page_types.yaml`. On first ingestion the LLM
-analyses a sample of source articles and proposes a per-corpus directory
-schema; you can also set it manually.
+## Sources
 
-**Fixed infrastructure directories:**
+`sources/versions/<source_id>--<version_id>.md` stores the exact UTF-8 source text.
+The companion JSON stores origin identity, title, IDs, path and length.
+`source_id = sha256(explicit origin identity)`; `version_id = sha256(original text)`.
+Preprocessed benchmark sources use dataset + Wikipedia title as origin identity.
+Custom articles should set `source_identity` to a stable URI or upstream ID;
+otherwise the absolute input path URI is used. Neither source title nor filename
+establishes the identity of an entity in the knowledge graph.
 
-```
-wiki/
-├── sources/               # source-page root
-│   ├── digests/           #   structured summaries of source paragraphs
-│   └── articles/          #   verbatim copies of the original source text
-├── syntheses/             # distilled query-result pages
-├── index.md               # listing of directories with descriptions + page counts
-├── overview.md            # global overview (regenerated periodically)
-├── log.md                 # append-only operation log
-└── page_types.yaml        # registry of page types
-```
+References contain `source_id`, `version_id`, `start`, `end`, and `quote`.
+Positions are Unicode character offsets in the archived text, end-exclusive.
+The quote must exactly equal that range. Event time belongs in the fact, never
+in the source version. Legacy archives remain accessible; exact source links
+can be snapshotted and read without guessing origins from similar filenames.
 
-**Dynamic page-type directories** (defined in `page_types.yaml`, generated on
-first ingestion; one per corpus):
+## Knowledge pages
 
-```
-wiki/
-├── {type_a}/              # e.g. entities/, events/, concepts/, relations/
-├── {type_b}/
-└── {type_c}/              # exact names and descriptions vary per corpus
-```
-
-## Frontmatter
+Pages live in content directories chosen by the builder. New page frontmatter:
 
 ```yaml
 ---
-type: source|synthesis|{dynamic_type}
-aliases: [list of aliases / variant names]
-tags: [list of tags]
+title: Alice Example
+entity_id: person:alice-example:born-1980
+aliases: [A. Example]
+type: people
+description: Alice Example, researcher born in 1980.
 ---
 ```
 
-> `type` matches the directory name.
-> `aliases` is used at retrieval time — list common aliases, foreign names and
-> alternative translations.
-> `created` and `updated` are injected by the engine; the LLM does not need to
-> emit them.
+Each page has one managed JSON fact block, delimited by
+`<!-- wiki-facts:start -->` and `<!-- wiki-facts:end -->`.
+Existing Markdown outside this block is preserved byte-for-byte by fact updates.
+`wiki_read(view="facts")` returns its structured facts; `view="relations"` filters
+relationship facts. The default text view keeps the entire legacy page accessible.
 
-### Generic knowledge-page template (`{dir}/`)
+Each fact has:
 
-```markdown
----
-type: {dir}
-aliases: [aliases]
-tags: [tags]
----
+- `id`: computed from the complete qualified statement, independent of citations.
+- `statement`, `event_time`, `conditions`, `polarity`, `certainty`, `kind`.
+- `citations`: one or more exact original references.
+- `conflicts_with`, `supersedes`: existing fact IDs; prior facts remain stored.
 
-# Page title
+`kind` is `fact`, `relation`, or `summary`. Summaries require evidence too and do
+not replace original verification. A relation requires two distinct existing
+linked pages. There is no arbitrary minimum link count for other facts.
 
-## Basic info
-- Key attribute 1:
-- Key attribute 2:
+`fact_apply` accepts a page path, identity, expected revision, facts, and links.
+For an existing page, its expected revision comes from `wiki_read`; stale updates
+fail. New pages require a null revision. The server reads the complete old page,
+merges only the supplied increments, validates citations and links, and atomically
+replaces the file under a write lock. Same-name entities require disambiguation.
+Adding the same qualified fact adds evidence idempotently. Changed claims get new
+IDs and explicit conflict/supersession relationships. No tool deletes old claims.
 
-## Core facts
-- Fact 1 (use full noun phrases — avoid pronouns)
-- Fact 2
+## Read and exploration tools
 
-## Related pages
-- [[dir/page]] — relationship description
+- `wiki_tree`: all actual directories with descriptions and counts.
+- `wiki_read`: directory browsing (paged), text windows, sections, summaries,
+  structured facts, or relations. Follow `next_start` for more content.
+- `wiki_search`: standard BM25; optional exact-full-entity-first ordering.
+- `entity_lookup`: exact complete title/alias lookup; returns all ambiguous candidates
+  up to the configured limit, without merging their identities.
+- `source_read`: immutable source windows and their exact offsets.
 
-## Related sources
-- [[sources/digests/YYYY-MM-DD-slug]] — what this source contributes
-```
+## Build and answer completion
 
-### Source-digest template (`sources/digests/`)
+Builds are document scoped. `.build/receipts/` records source versions, products,
+status, tool trace, elapsed time, calls, and token usage when returned by the API.
+Successful receipts require complete source-read coverage and verified fact products.
+Partial writes remain retryable and increments are idempotent. Old SHA-only success
+caches are not trusted. Legacy heuristic whole-page repair passes are not called.
 
-> All five sections below are **mandatory** — write them even when the
-> source paragraph is short.
+The premium Answer Agent explores and submits `finish_answer` with separate answer,
+reasoning, citations, optional summary_refs, gaps, and status. Original citations must
+have been read. Unknown/conflicting/unfinished results are explicit. The default
+and CLI use one QA agent with no delegation. The older explicit Python subtask
+option remains for compatibility; it is disabled by default.
 
-```markdown
----
-type: source
-source_date: YYYY-MM-DD
-source_article: <source file stem, without path prefix or .md extension>
-tags: [tags]
----
+## One cross-document summary layer
 
-# Source title
+`summaries/<hash-of-child-paths>.md` is owned exclusively by `SummaryStore`; ordinary
+fact writes cannot modify it. Its managed `wiki-summary` block contains level=1,
+child page paths/revisions, and 1..8 claims. Each claim has an ID, statement,
+direct/synthesis kind, supporting page/fact IDs, and server-derived original citations.
+Children must be 2..4 knowledge pages, with evidence from at least two distinct
+source identities. Current generation proposes pairs. Source copies, legacy prose,
+superseded facts, and summary facts cannot serve as child facts. Explicit conflicts
+remain visible. Coverage is selected facts, not an exhaustive summary of every source.
 
-> Source: {origin} | {date}
+The summary compiler runs after document ingestion, with `SUMMARY_BUILD_LIMIT=20`
+model calls by default (0 disables). A separate `build_summaries` CLI resumes pending
+groups. Failures remain retryable; skipped groups are cached until their input changes.
+Page revisions and the known source-version sets are captured before generation and
+checked before committing. Old summary revisions are kept in `.summary-history/`.
+Changed/missing child pages, changed source-version sets, or invalid original sources
+make a summary stale. Stale summaries return navigation only and are excluded from
+search. `current` means dependencies unchanged, not semantic correctness or latest truth.
 
-## Summary
-A summary of at most 200 words. (required)
+`wiki_search(layer="summaries"|"details"|"all")` supports both entry points.
+`summary_read(path, view="overview")` gives prose and child navigation;
+`view="claims"` gives the claim/support map; `view="evidence", claim_ids=[id]`
+reveals supporting facts and citations for one claim at a time. No summary read
+counts as an original read: `source_read` is still required. Knowledge-page reads
+also expose current `related_summaries` as reverse navigation.
 
-## Core claims
-- Author/origin asserts that … (judgements/opinions, not just encyclopedic facts) (required)
-
-## Key quotes
-- "Direct quotation from the source." — speaker, if applicable (required, ≥1)
-
-## Key facts
-- Fact 1
-- Fact 2
-(required, ≥2)
-
-## Mentioned entities
-- [[entity name]]
-(required, ≥1)
-```
-
-## Writing style (the wiki is consumed by an LLM for retrieval)
-
-- **Information density first.** Prefer structured fact lists over prose paragraphs.
-- **Use full noun phrases.** Avoid pronouns ("he", "it") — they break entity matching.
-- **Informative headings.** Use "Life and style" rather than "About"; "Structural analysis" rather than "Closer look".
-- **Always declare aliases.** Common nicknames, foreign-language names and alternative spellings go into the frontmatter `aliases` field.
-- **Link sources by full path.** `[[sources/digests/YYYY-MM-DD-slug]]`.
-
-## Naming conventions
-
-- Knowledge pages: use the canonical English page name (e.g. `Tan_Dun.md`).
-- Source digest pages: `YYYY-MM-DD-slug.md` under `sources/digests/`.
-- Avoid filesystem-unsafe characters: `/` → `-`, `"` → removed, `|` → `-`.
-- Wiki links use `[[page]]` syntax (no `.md` extension).
+`finish_answer.summary_refs` contains `{path, revision, claim_ids}`. Every referenced
+claim must have been expanded to evidence, remain current, and have all its supporting
+original citation ranges covered by final citations that were actually read.
+This checks provenance and coverage, not semantic entailment. The QA agent must
+evaluate each reasoning step and report unresolved gaps.

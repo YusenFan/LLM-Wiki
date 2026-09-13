@@ -68,6 +68,8 @@ def get_llm_headers() -> dict:
 # Ingestion parameters
 # ---------------------------------------------------------------------------
 
+INGEST_TOOL_BUDGET        = int(os.environ.get("INGEST_TOOL_BUDGET", "40"))
+SUMMARY_BUILD_LIMIT       = int(os.environ.get("SUMMARY_BUILD_LIMIT", "20"))
 INGEST_BATCH_SIZE         = 10
 INGEST_MAX_CONTENT_LEN    = 15000
 INGEST_MIN_CONTENT_LEN    = 50
@@ -196,7 +198,7 @@ def get_page_types() -> dict:
         if wiki_yaml.exists():
             try:
                 data = yaml.safe_load(wiki_yaml.read_text(encoding="utf-8"))
-                if data and "page_types" in data and data["page_types"]:
+                if isinstance(data, dict) and isinstance(data.get("page_types"), dict):
                     return data["page_types"]
             except (yaml.YAMLError, OSError):
                 pass
@@ -204,7 +206,7 @@ def get_page_types() -> dict:
     if template.exists():
         try:
             data = yaml.safe_load(template.read_text(encoding="utf-8"))
-            if data and "page_types" in data and data["page_types"]:
+            if isinstance(data, dict) and isinstance(data.get("page_types"), dict):
                 return data["page_types"]
         except (yaml.YAMLError, OSError):
             pass
@@ -298,31 +300,12 @@ def ensure_wiki_dirs() -> None:
         return
     WIKI_DIR.mkdir(parents=True, exist_ok=True)
 
-    if _current_dataset:
-        purpose_path = BASE_DIR / f"purpose_{_current_dataset}.md"
-        if not purpose_path.exists():
-            try:
-                auto_init_purpose()
-            except Exception:
-                pass
-
-    yaml_path = WIKI_DIR / "page_types.yaml"
-    need_init = True
-    if yaml_path.exists():
-        try:
-            data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-            if data and "page_types" in data and data["page_types"]:
-                need_init = False
-        except (yaml.YAMLError, OSError):
-            pass
-    if need_init:
-        try:
-            auto_init_page_types()
-        except Exception:
-            save_page_types(DEFAULT_PAGE_TYPES)
-
-    for name, dir_path in get_page_dirs().items():
-        dir_path.mkdir(parents=True, exist_ok=True)
+    # Start from actual content, never infer a mandatory taxonomy from samples.
+    for name in FIXED_DIRS:
+        (WIKI_DIR / name).mkdir(parents=True, exist_ok=True)
+    (WIKI_DIR / "sources" / "versions").mkdir(parents=True, exist_ok=True)
+    if not (WIKI_DIR / "page_types.yaml").exists():
+        save_page_types({})
 
 # ---------------------------------------------------------------------------
 # Purpose file management
@@ -334,9 +317,6 @@ def get_purpose_file() -> Path:
         candidate = BASE_DIR / f"purpose_{_current_dataset}.md"
         if candidate.exists():
             return candidate
-        result = auto_init_purpose()
-        if result is not None and result.exists():
-            return result
     return CONFIGS_DIR / "purpose_bench.md"
 
 # ---------------------------------------------------------------------------
@@ -445,42 +425,6 @@ def auto_init_purpose() -> Path | None:
 
 
 def auto_init_page_types() -> None:
-    """Ask the LLM to design 5-8 page-type directories for the corpus."""
-    from llm_client import call_llm_json
-
-    samples = _sample_articles_for_init(n=200)
-    if not samples or len(samples) < 5:
-        save_page_types(DEFAULT_PAGE_TYPES)
-        return
-
-    sample_text = "\n".join(
-        f"### Article {i}: {s['title']}\n{s['excerpt']}\n"
-        for i, s in enumerate(samples[:50], 1)
-    )
-    try:
-        data = call_llm_json(
-            system_prompt=(
-                "You are a knowledge base architect. Design 5-8 mutually exclusive, "
-                "collectively exhaustive page-type directories for the corpus below.\n"
-                "Output strictly JSON: "
-                '{"page_types": {"<name>": {"description": "<name> — short desc"}}}\n'
-                "Rules: lowercase single-word English names; avoid catch-all names "
-                "(misc/other/general/uncategorized); do not redefine the reserved "
-                "names sources, syntheses."
-            ),
-            user_prompt=f"## Articles\n{sample_text}\n",
-            model=LLM_PREMIUM_MODEL,
-            temperature=0.3,
-        )
-    except Exception:
-        save_page_types(DEFAULT_PAGE_TYPES)
-        return
-
-    raw_types = data.get("page_types", data) if isinstance(data, dict) else {}
-    page_types: dict = {
-        name: {"description": (info.get("description", name) if isinstance(info, dict) else info),
-               "auto_created": True}
-        for name, info in raw_types.items()
-        if isinstance(info, (dict, str))
-    }
-    save_page_types(page_types if page_types else DEFAULT_PAGE_TYPES)
+    """Compatibility entry point: initialize an empty, content-driven registry."""
+    if WIKI_DIR is not None and not (WIKI_DIR / "page_types.yaml").exists():
+        save_page_types({})
