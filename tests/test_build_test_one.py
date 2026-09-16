@@ -20,6 +20,9 @@ class TestBuildOne(unittest.TestCase):
                  'context': [[f'Article {i}', [f'Article {i} text.']] for i in range(10)]},
                 {'_id': 'two', 'question': 'Q2?', 'answer': 'B', 'context': [['Excluded', ['Not in test.']]]},
             ]))
+            stale = root / 'wiki_output/hotpotqa/test-one/raw/articles/old-name.md'
+            stale.parent.mkdir(parents=True)
+            stale.write_text('Stale output from before the merge.')
             stats = {'success': 10, 'failed': 0, 'summaries': {'failed': 0}}
             with patch.object(build_test_one, 'ROOT', root), \
                  patch.object(build_test_one.config, 'set_dataset') as configure, \
@@ -30,6 +33,8 @@ class TestBuildOne(unittest.TestCase):
             configure.assert_called_once_with('hotpotqa', wiki_dir=root / 'wiki_output/hotpotqa/test-one/wiki')
             paths = ingest.call_args.args[0]
             self.assertEqual(len(paths), 10)
+            self.assertNotIn(stale, paths)
+            self.assertTrue(stale.exists())
             self.assertTrue(all(path.parent == root / 'wiki_output/hotpotqa/test-one/raw/articles' for path in paths))
             self.assertFalse(any(path.stem == 'Excluded' for path in paths))
             report = root / 'wiki_output/hotpotqa/test-one/build-result.json'

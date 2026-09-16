@@ -61,6 +61,8 @@ class RetrievalResult:
     trace: list[str] = field(default_factory=list)               # human-readable log
     tool_calls: list[dict] = field(default_factory=list)         # raw call log
     total_calls: int = 0
+    llm_calls: int = 0
+    usage_by_model: dict[str, dict[str, int]] = field(default_factory=dict)
     evidence: list[dict] = field(default_factory=list)         # exact article passages actually read
     search_top_results: list[str] = field(default_factory=list)  # top search-hit paths for review
 
@@ -129,6 +131,14 @@ class WikiAgent:
                 _logger.warning("agent LLM call failed; stopping")
                 break
 
+            # The merged client adds local accounting metadata, not an API message field.
+            assistant_msg = dict(assistant_msg)
+            usage = assistant_msg.pop("_usage", {})
+            result.llm_calls += 1
+            counts = result.usage_by_model.setdefault(self.model or "default", {})
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                if isinstance(usage.get(key), int):
+                    counts[key] = counts.get(key, 0) + usage[key]
             messages.append(assistant_msg)
             tool_calls = assistant_msg.get("tool_calls") or []
 

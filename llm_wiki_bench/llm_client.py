@@ -16,15 +16,20 @@ import re
 import time
 import requests
 
-import bench_config as config
+try:
+    from . import bench_config as config
+except ImportError:
+    import bench_config as config
 
 _llm_logger = logging.getLogger("ingest.llm")
 
 
+# 【HTTP 配置】从进程环境读取 OPENAI_BASE_URL 并去尾斜杠；这里只拼端点，不自动加载 .env。
 def _api_base() -> str:
     return os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 
 
+# 【HTTP 配置】从环境读取密钥，构造 JSON 与 Bearer 请求头；缺失密钥时 Authorization 为空。
 def _headers() -> dict:
     api_key = os.environ.get("OPENAI_API_KEY", "")
     return {
@@ -33,6 +38,8 @@ def _headers() -> dict:
     }
 
 
+# 【文本模型调用】构造 system/user 消息并 POST /chat/completions；可请求 JSON，最多五次尝试，失败最终抛 RuntimeError。
+# 返回文本而非已执行动作；无 content 时可能退回提供商 reasoning 字段。
 def call_llm(
     system_prompt: str,
     user_prompt: str,
@@ -125,6 +132,8 @@ def call_llm(
             raise RuntimeError(f"LLM call failed after {MAX_RETRIES} retries: {e}") from e
 
 
+# 【旧 JSON 调用】先请求 JSON 模式，调用失败后回退普通文本；依次尝试整体 JSON、代码围栏、首左花括号到末右花括号的切片。
+# 不是平衡括号解析器，也不保证返回值一定是 dict。
 def call_llm_json(
     system_prompt: str,
     user_prompt: str,
@@ -163,6 +172,8 @@ def call_llm_json(
     raise RuntimeError(f"Cannot parse LLM output as JSON:\n{text[:500]}")
 
 
+# 【当前模型接口】发送完整 messages 与工具 Schema，tool_choice=auto；返回 assistant message 并附 _usage，重试耗尽返回 None。
+# 工具调用仍只是提议，调用方负责解析、验证和执行；一次逻辑调用可能发生多次 HTTP 请求。
 def call_llm_with_tools(
     messages: list[dict],
     tools: list[dict],
@@ -198,7 +209,9 @@ def call_llm_with_tools(
             if not resp.text or not resp.text.strip():
                 raise RuntimeError(f"Empty response (status={resp.status_code})")
             data = resp.json()
-            return data["choices"][0]["message"]
+            message = data["choices"][0]["message"]
+            message["_usage"] = data.get("usage", {})
+            return message
         except (requests.RequestException, KeyError, IndexError,
                 json.JSONDecodeError, RuntimeError) as e:
             if attempt < MAX_RETRIES - 1:

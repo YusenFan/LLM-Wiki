@@ -28,6 +28,7 @@ RESULTS_DIR = BASE_DIR / "results"
 
 # ─── HotpotQA-style normalization ─────────────────────────────────────────
 
+# 【评分归一】小写化，去英文冠词、ASCII 标点并压缩空白；专为答案文本比较，不是语义等价判断。
 def _normalize_answer(text: str) -> str:
     """Lower-case, strip punctuation, articles, and extra whitespace."""
     text = text.lower()
@@ -37,10 +38,12 @@ def _normalize_answer(text: str) -> str:
     return text
 
 
+# 【答案 EM】比较归一化后的预测与标准答案是否完全相同，返回 0.0 或 1.0。
 def exact_match(prediction: str, ground_truth: str) -> float:
     return float(_normalize_answer(prediction) == _normalize_answer(ground_truth))
 
 
+# 【答案 F1】按归一化后空白 token 的多重集合交集计算精确率／召回率调和平均；两个空答案为 1，单侧空为 0。
 def token_f1(prediction: str, ground_truth: str) -> float:
     pred_toks = _normalize_answer(prediction).split()
     gold_toks = _normalize_answer(ground_truth).split()
@@ -57,6 +60,7 @@ def token_f1(prediction: str, ground_truth: str) -> float:
     return 2 * p * r / (p + r)
 
 
+# 【别名评分】遍历标准答案及别名，分别取最高 EM 和 F1；两者最优值可以来自不同别名。
 def score_against_aliases(prediction: str, gold_answers: list[str]) -> dict:
     """Take the maximum EM/F1 over all gold answer aliases."""
     best_em, best_f1 = 0.0, 0.0
@@ -68,6 +72,7 @@ def score_against_aliases(prediction: str, gold_answers: list[str]) -> dict:
 
 # ─── I/O helpers ──────────────────────────────────────────────────────────
 
+# 【评估输入】从 data/<dataset>/qa_pairs.jsonl 读取非空行，缺失时退出并提示预处理。
 def _load_qa_pairs(dataset: str) -> list[dict]:
     path = DATA_DIR / dataset / "qa_pairs.jsonl"
     if not path.exists():
@@ -77,6 +82,7 @@ def _load_qa_pairs(dataset: str) -> list[dict]:
         return [json.loads(line) for line in f if line.strip()]
 
 
+# 【评估输入】按问题 id 建预测字典；同一 id 多条记录时后者覆盖前者。
 def _load_predictions(path: Path) -> dict:
     preds: dict = {}
     with open(path, encoding="utf-8") as f:
@@ -90,6 +96,8 @@ def _load_predictions(path: Path) -> dict:
 
 # ─── Aggregation ──────────────────────────────────────────────────────────
 
+# 【评估聚合】对有预测的题目计算 EM/F1、标题召回代理和用量，并按支撑标题数／题型分组；缺失预测单独计 missing，不进入平均分分母。
+# 返回 (汇总, 逐题结果)，不核验引文语义。
 def evaluate(qa_pairs: list[dict], predictions: dict) -> tuple[dict, list[dict]]:
     em_sum = f1_sum = 0.0
     total = 0
@@ -99,6 +107,9 @@ def evaluate(qa_pairs: list[dict], predictions: dict) -> tuple[dict, list[dict]]
     hop_f1: dict[int, list[float]] = {}
     type_f1: dict[str, list[float]] = {}
     details: list[dict] = []
+    llm_calls = elapsed_seconds = citation_count = gap_count = summary_reference_count = 0
+    source_title_recall = []
+    usage_by_model = {}
 
     for qa in qa_pairs:
         qid = qa["id"]
@@ -123,6 +134,19 @@ def evaluate(qa_pairs: list[dict], predictions: dict) -> tuple[dict, list[dict]]
         pages = len(pred.get("retrieved_titles", []) or [])
         steps_sum += steps
         pages_sum += pages
+        llm_calls += pred.get("llm_calls", 0)
+        elapsed_seconds += pred.get("elapsed_seconds", 0)
+        citation_count += len(pred.get("citations", []))
+        summary_reference_count += len(pred.get('summary_refs', []))
+        gap_count += bool(pred.get("evidence_gaps"))
+        for model, counts in pred.get("usage_by_model", {}).items():
+            target = usage_by_model.setdefault(model, {})
+            for key, value in counts.items():
+                target[key] = target.get(key, 0) + value
+        gold_titles = {_normalize_answer(t) for t in qa.get("supporting_titles", [])}
+        read_titles = {_normalize_answer(t) for t in pred.get("retrieved_titles", [])}
+        if gold_titles:
+            source_title_recall.append(len(gold_titles & read_titles) / len(gold_titles))
 
         hop = len(qa.get("supporting_titles", [])) or 1
         hop_f1.setdefault(hop, []).append(scores["f1"])
@@ -153,6 +177,13 @@ def evaluate(qa_pairs: list[dict], predictions: dict) -> tuple[dict, list[dict]]
         "f1": f1_sum / total,
         "avg_retrieval_steps": steps_sum / total,
         "avg_pages_read": pages_sum / total,
+        "avg_llm_calls": llm_calls / total,
+        "avg_elapsed_seconds": elapsed_seconds / total,
+        "avg_citations": citation_count / total,
+        "avg_summary_references": summary_reference_count / total,
+        "evidence_gap_rate": gap_count / total,
+        "supporting_title_read_recall_proxy": sum(source_title_recall) / len(source_title_recall) if source_title_recall else None,
+        "usage_by_model": usage_by_model,
         "hop_wise_f1": {
             f"{h}-hop": {"f1": sum(v) / len(v), "count": len(v)}
             for h, v in sorted(hop_f1.items())
@@ -167,6 +198,7 @@ def evaluate(qa_pairs: list[dict], predictions: dict) -> tuple[dict, list[dict]]
 
 # ─── CLI ──────────────────────────────────────────────────────────────────
 
+# 【显示】把汇总指标输出到终端；不改变预测或评估结果。
 def _print_summary(summary: dict, dataset: str) -> None:
     print(f"\n{'='*60}\n  Evaluation — {dataset}\n{'='*60}")
     print(f"  Total evaluated: {summary['total']}  (missing: {summary['missing']})")
@@ -188,6 +220,7 @@ def _print_summary(summary: dict, dataset: str) -> None:
     print("=" * 60)
 
 
+# 【评估 CLI】读取 QA 和 predictions，应用题数限制后评分，写 summary JSON 与 details JSONL；不调用模型。
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate LLM-Wiki answer predictions.")
     parser.add_argument("--dataset", "-d", required=True,

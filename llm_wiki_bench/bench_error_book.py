@@ -30,6 +30,7 @@ import bench_config as config
 
 # ─── Core IO ───
 
+# 【旧错误簿】返回当前 wiki 的错误簿 YAML 路径；未配置时退回工作目录的 error_book.yaml。
 def _get_error_book_path() -> Path:
     """Path to the error-book YAML file."""
     wiki_dir = config.WIKI_DIR
@@ -38,6 +39,7 @@ def _get_error_book_path() -> Path:
     return Path("error_book.yaml")
 
 
+# 【旧错误簿读取】加载 YAML 错误记录，缺失／异常时按代码兜底返回；当前 BuildAgent 不注入这份错误簿。
 def load_error_book() -> list[dict]:
     """Load the error book."""
     path = _get_error_book_path()
@@ -52,6 +54,7 @@ def load_error_book() -> list[dict]:
         return []
 
 
+# 【旧错误簿写入】把错误条目序列化为 YAML 保存，供旧维护循环持久记录。
 def save_error_book(errors: list[dict]):
     """Save the error book."""
     path = _get_error_book_path()
@@ -67,6 +70,7 @@ def save_error_book(errors: list[dict]):
 
 # ─── Constraint injection ───
 
+# 【旧 schema 兼容】优先当前 active_samples，否则读取旧 samples 列表。
 def _get_samples(e: dict) -> list:
     """Read the sample list, supporting both legacy and current schemas.
 
@@ -76,6 +80,7 @@ def _get_samples(e: dict) -> list:
     return e.get("active_samples", e.get("samples", []))
 
 
+# 【旧 schema 兼容】读取 still_active 或旧 count，统一提供问题数量。
 def _get_count(e: dict) -> int:
     """Read the issue count, supporting both schemas.
 
@@ -86,6 +91,7 @@ def _get_count(e: dict) -> int:
     return e.get("count", 0)
 
 
+# 【旧 schema 兼容】依据条目已有字段写入样本列表，原地修改字典。
 def _set_samples(e: dict, samples: list):
     """Write the sample list, picking the field present on the entry."""
     if "active_samples" in e:
@@ -94,6 +100,7 @@ def _set_samples(e: dict, samples: list):
         e["samples"] = samples
 
 
+# 【旧 schema 兼容】依据条目已有字段写入问题数量，原地修改字典。
 def _set_count(e: dict, count: int):
     """Write the issue count, picking the field present on the entry."""
     if "still_active" in e:
@@ -102,6 +109,7 @@ def _set_count(e: dict, count: int):
         e["count"] = count
 
 
+# 【旧提示词材料】把开放错误记录格式化为约束文字，用于旧生成／修复提示词；函数自身不调用 LLM。
 def get_active_constraints() -> str:
     """Return the formatted constraint text for every open error-book entry.
 
@@ -200,6 +208,7 @@ _ISSUE_TEMPLATES = {
 }
 
 
+# 【旧错误聚合】按 category 合并 lint 结果、时间及样本，并附批次文章上下文后保存错误簿。
 def record_lint_issues(issues: dict, batch_article_stems: list[str] | None = None):
     """Record lint findings into the error book.
 
@@ -341,6 +350,7 @@ def record_lint_issues(issues: dict, batch_article_stems: list[str] | None = Non
         save_error_book(errors)
 
 
+# 【旧错误记录】记录单条样本及其修复上下文，让后续旧 LLM 修复能定位原始材料。
 def record_sample_with_context(category: str, sample_name: str,
                                 context: dict | None = None,
                                 template: dict | None = None):
@@ -410,6 +420,7 @@ def record_sample_with_context(category: str, sample_name: str,
 
 # ─── Fix-state management ───
 
+# 【旧数据升级】把字符串样本转成带 name/fixed 状态的字典，兼容已有字典。
 def _normalize_sample(s) -> dict:
     """Upgrade a legacy plain-string sample to the dict shape with fix state.
 
@@ -422,6 +433,7 @@ def _normalize_sample(s) -> dict:
     return {"name": str(s), "fixed": False}
 
 
+# 【旧字段读取】从字符串或字典样本提取页面／错误名称。
 def _sample_name(s) -> str:
     """Extract the page name from a sample (dict or plain string)."""
     if isinstance(s, dict):
@@ -429,6 +441,7 @@ def _sample_name(s) -> str:
     return str(s)
 
 
+# 【旧状态读取】判断样本是否明确标记 fixed，旧字符串视作未修复。
 def _sample_is_fixed(s) -> bool:
     """Return True if the sample has been marked as fixed."""
     if isinstance(s, dict):
@@ -436,12 +449,14 @@ def _sample_is_fixed(s) -> bool:
     return False
 
 
+# 【旧队列读取】从一个错误条目取尚未修复的样本名称列表。
 def get_unfixed_samples(error_entry: dict) -> list[str]:
     """Return the names of all unfixed samples in an error-book entry."""
     return [_sample_name(s) for s in _get_samples(error_entry)
             if not _sample_is_fixed(s)]
 
 
+# 【旧队列检查】判断指定类别或全错误簿是否还有未修复样本，返回布尔值。
 def has_unfixed_samples(category: str = None) -> bool:
     """Return True if there are unfixed samples of the given category (or any category)."""
     errors = load_error_book()
@@ -455,6 +470,7 @@ def has_unfixed_samples(category: str = None) -> bool:
     return False
 
 
+# 【旧状态写入】用精确、前后缀及别名拆分等宽松规则匹配修复名称，更新样本、计数及关闭状态后保存；不是严格事实 ID 匹配。
 def mark_samples_fixed(category: str, fixed_names: list[str]):
     """Mark matching samples in the given category as fixed.
 
@@ -528,6 +544,7 @@ def mark_samples_fixed(category: str, fixed_names: list[str]):
 
 # ─── Summary printing ───
 
+# 【旧状态显示】终端打印错误簿概览和样本，不生成或修复 wiki 内容。
 def print_error_book():
     """Print a human-readable error-book summary."""
     errors = load_error_book()
@@ -577,6 +594,7 @@ def print_error_book():
 
 # ─── Expiry cleanup ───
 
+# 【旧记录清理】过滤已关闭超过 max_age_days 的条目；清理的是错误记录，不是知识页面。
 def _cleanup_old_closed(errors: list[dict], max_age_days: int = 30):
     """Hard-delete entries that have been closed for more than ``max_age_days`` days.
 
@@ -605,6 +623,7 @@ def _cleanup_old_closed(errors: list[dict], max_age_days: int = 30):
 
 # ─── Repair log (lint_ledger.jsonl) ───
 
+# 【旧修复日志】返回 lint_ledger.jsonl 路径，供修复流水追加使用。
 def _get_ledger_path() -> Path:
     """Path to the repair-log JSONL file."""
     wiki_dir = config.WIKI_DIR
@@ -613,6 +632,7 @@ def _get_ledger_path() -> Path:
     return Path("lint_ledger.jsonl")
 
 
+# 【旧日志写入】追加一条带问题类型、文件、修复方式及数量的 JSONL 记录；auto_fixed 区分代码修复与模型修复。
 def append_ledger(
     issue_type: str,
     file: str = "",
@@ -649,6 +669,7 @@ def append_ledger(
         pass  # log write failures must not interrupt the main pipeline
 
 
+# 【旧日志读取】读回修复流水 JSONL，供统计／查看历史。
 def load_ledger() -> list[dict]:
     """Load all repair-log entries."""
     path = _get_ledger_path()
@@ -670,6 +691,7 @@ def load_ledger() -> list[dict]:
     return entries
 
 
+# 【旧修复材料】按类别返回未修复样本的完整字典及上下文，供旧修复流程读取文章。
 def get_unfixed_samples_full(category: str) -> list[dict]:
     """Return all unfixed samples (with context) for the given category, for use by the repair pass."""
     errors = load_error_book()

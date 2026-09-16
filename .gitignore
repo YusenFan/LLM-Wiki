@@ -1,4 +1,5 @@
 # Python
+node_modules/
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -21,3 +22,5 @@ logs/
 .idea/
 
 purpose_hotpotqa.md
+# local credentials
+.env

@@ -196,6 +196,8 @@ def main() -> None:
                 "retrieval_trace": rr.trace if rr else [],
                 "retrieval_steps": rr.total_calls if rr else 0,
                 "article_evidence": rr.evidence if rr else [],
+                "retrieval_llm_calls": rr.llm_calls if rr else 0,
+                "retrieval_usage_by_model": rr.usage_by_model if rr else {},
                 "error": error,
             }
             fout.write(json.dumps(record, ensure_ascii=False) + "\n")

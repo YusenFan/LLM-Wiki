@@ -24,7 +24,7 @@ def main() -> None:
         raise SystemExit(f"Dataset not found: {input_path}")
 
     test_dir = ROOT / "wiki_output/hotpotqa/test-one"
-    process_hotpotqa(
+    processed = process_hotpotqa(
         input_path=input_path,
         output_dir=test_dir / "raw",
         data_dir=test_dir / "data",
@@ -34,7 +34,8 @@ def main() -> None:
     config.set_dataset("hotpotqa", wiki_dir=test_dir / "wiki")
     config.ensure_wiki_dirs()
 
-    articles = sorted((test_dir / "raw/articles").glob("*.md"))
+    # Use this run's files, not stale names left by a different preprocessing version.
+    articles = sorted(Path(path) for path in processed["article_paths"])
     if not articles:
         raise SystemExit("No articles found for the test question.")
     print(f"Building from {len(articles)} articles into {test_dir / 'wiki'}", flush=True)

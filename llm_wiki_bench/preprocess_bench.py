@@ -18,6 +18,8 @@ Usage:
     python preprocess_bench.py --dataset hotpotqa --limit 500
 """
 
+import hashlib
+import yaml
 import argparse
 import json
 import re
@@ -31,6 +33,7 @@ RAW_DIR = BASE_DIR / "raw"
 DATA_DIR = BASE_DIR / "data"
 
 
+# 【文件名清洗】将非法文件名字符替换为下划线并规范空白、截长；碰撞由 _write_articles 的哈希后缀处理。
 def sanitize_filename(name: str) -> str:
     """Strip characters that are illegal in file names."""
     # Strip filesystem-illegal characters.
@@ -43,6 +46,31 @@ def sanitize_filename(name: str) -> str:
     return name[:200] if name else "untitled"
 
 
+# 【文章落盘】将去重后的标题／正文变体写成 Markdown，保留明确 source_identity；文件名加哈希避免清洗后的同名碰撞。
+# 原文版本由 article 归档对完整输入计算。
+def _write_articles(paragraphs: dict, output_dir: Path, dataset: str) -> list[str]:
+    """Preserve all title/text variants; source identity is separate from version.
+
+    Wikipedia title identifies a source in this dataset, never a Wiki entity.
+    Hash suffixes prevent collisions from filename sanitization and title truncation.
+    """
+    articles_dir = output_dir / "articles"
+    articles_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for (title, text) in paragraphs:
+        identity = f"{dataset}:wikipedia:{title}"
+        sid = hashlib.sha256(identity.encode()).hexdigest()
+        version = hashlib.sha256(text.encode()).hexdigest()
+        metadata = {"source_identity": identity, "source_id": sid,
+                    "source_type": "wikipedia", "title": title, "dataset": dataset}
+        content = "---\n" + yaml.safe_dump(metadata, allow_unicode=True, sort_keys=False) + "---\n\n# " + title + "\n\n" + text + "\n"
+        path = articles_dir / f"{sanitize_filename(title)[:100]}--{sid[:16]}--{version[:16]}.md"
+        path.write_text(content, encoding="utf-8")
+        written.append(str(path))
+    return written
+
+
+# 【数据转换】读取 HotpotQA JSON，按 limit 选题，收集 context 中全部不同标题／正文组合（含干扰段落），写文章和统一 qa_pairs.jsonl，返回数量统计。
 def process_hotpotqa(input_path: Path, output_dir: Path, data_dir: Path,
                      limit: int = None) -> dict:
     """Process the HotpotQA distractor dev set.
@@ -65,7 +93,7 @@ def process_hotpotqa(input_path: Path, output_dir: Path, data_dir: Path,
         data = data[:limit]
         print(f"  🔢 Limiting to first {limit} QA items")
 
-    # Collect all unique paragraphs (deduplicated by title).
+    # Collect all unique paragraphs (deduplicated by exact title and text).
     paragraphs = {}  # title -> full_text
     qa_pairs = []
 
@@ -76,9 +104,8 @@ def process_hotpotqa(input_path: Path, output_dir: Path, data_dir: Path,
 
         # Extract context paragraphs.
         for title, sentences in item.get("context", []):
-            if title not in paragraphs:
-                full_text = " ".join(sentences)
-                paragraphs[title] = full_text
+            full_text = " ".join(sentences)
+            paragraphs[(title, full_text)] = True
 
         qa_pairs.append({
             "id": item.get("_id", ""),
@@ -89,29 +116,7 @@ def process_hotpotqa(input_path: Path, output_dir: Path, data_dir: Path,
             "supporting_titles": supporting_titles,
         })
 
-    # Write Markdown articles.
-    articles_dir = output_dir / "articles"
-    articles_dir.mkdir(parents=True, exist_ok=True)
-
-    written = 0
-    for title, text in paragraphs.items():
-        filename = sanitize_filename(title) + ".md"
-        filepath = articles_dir / filename
-
-        escaped_title = title.replace('"', '\\"')
-        md_content = f"""---
-source_id: {sanitize_filename(title)}
-source_type: wikipedia
-title: "{escaped_title}"
-dataset: hotpotqa
----
-
-# {title}
-
-{text}
-"""
-        filepath.write_text(md_content, encoding="utf-8")
-        written += 1
+    written = _write_articles(paragraphs, output_dir, "hotpotqa")
 
     # Write QA pairs.
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -122,11 +127,13 @@ dataset: hotpotqa
 
     return {
         "qa_count": len(qa_pairs),
-        "paragraph_count": written,
-        "unique_titles": len(paragraphs),
+        "paragraph_count": len(written),
+        "article_paths": written,
+        "unique_titles": len({title for title, _ in paragraphs}),
     }
 
 
+# 【数据转换】读取 MuSiQue JSONL，整理问题、别名及支撑标题并收集不同段落，输出统一文章与 QA 文件；不调用模型。
 def process_musique(input_path: Path, output_dir: Path, data_dir: Path,
                     limit: int = None) -> dict:
     """Process the MuSiQue-Ans dev set.
@@ -175,8 +182,7 @@ def process_musique(input_path: Path, output_dir: Path, data_dir: Path,
         for para in item.get("paragraphs", []):
             title = para["title"]
             text = para["paragraph_text"]
-            if title not in paragraphs:
-                paragraphs[title] = text
+            paragraphs[(title, text)] = True
             if para.get("is_supporting", False):
                 supporting_titles.append(title)
 
@@ -188,29 +194,7 @@ def process_musique(input_path: Path, output_dir: Path, data_dir: Path,
             "supporting_titles": list(set(supporting_titles)),
         })
 
-    # Write Markdown articles.
-    articles_dir = output_dir / "articles"
-    articles_dir.mkdir(parents=True, exist_ok=True)
-
-    written = 0
-    for title, text in paragraphs.items():
-        filename = sanitize_filename(title) + ".md"
-        filepath = articles_dir / filename
-
-        escaped_title = title.replace('"', '\\"')
-        md_content = f"""---
-source_id: {sanitize_filename(title)}
-source_type: wikipedia
-title: "{escaped_title}"
-dataset: musique
----
-
-# {title}
-
-{text}
-"""
-        filepath.write_text(md_content, encoding="utf-8")
-        written += 1
+    written = _write_articles(paragraphs, output_dir, "musique")
 
     # Write QA pairs.
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -221,11 +205,13 @@ dataset: musique
 
     return {
         "qa_count": len(qa_pairs),
-        "paragraph_count": written,
-        "unique_titles": len(paragraphs),
+        "paragraph_count": len(written),
+        "article_paths": written,
+        "unique_titles": len({title for title, _ in paragraphs}),
     }
 
 
+# 【数据转换】读取 2Wiki JSON，提取题目、支撑标题与上下文文章，保留标题／正文变体并写统一文件；不调用模型。
 def process_2wikimhqa(input_path: Path, output_dir: Path, data_dir: Path,
                       limit: int = None) -> dict:
     """Process the 2WikiMultiHopQA dev set.
@@ -256,9 +242,8 @@ def process_2wikimhqa(input_path: Path, output_dir: Path, data_dir: Path,
         supporting_titles = list(set(t for t, _ in item.get("supporting_facts", [])))
 
         for title, sentences in item.get("context", []):
-            if title not in paragraphs:
-                full_text = " ".join(sentences)
-                paragraphs[title] = full_text
+            full_text = " ".join(sentences)
+            paragraphs[(title, full_text)] = True
 
         qa_pairs.append({
             "id": item.get("_id", ""),
@@ -268,29 +253,7 @@ def process_2wikimhqa(input_path: Path, output_dir: Path, data_dir: Path,
             "supporting_titles": supporting_titles,
         })
 
-    # Write Markdown articles.
-    articles_dir = output_dir / "articles"
-    articles_dir.mkdir(parents=True, exist_ok=True)
-
-    written = 0
-    for title, text in paragraphs.items():
-        filename = sanitize_filename(title) + ".md"
-        filepath = articles_dir / filename
-
-        escaped_title = title.replace('"', '\\"')
-        md_content = f"""---
-source_id: {sanitize_filename(title)}
-source_type: wikipedia
-title: "{escaped_title}"
-dataset: 2wikimhqa
----
-
-# {title}
-
-{text}
-"""
-        filepath.write_text(md_content, encoding="utf-8")
-        written += 1
+    written = _write_articles(paragraphs, output_dir, "2wikimhqa")
 
     # Write QA pairs.
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -301,8 +264,9 @@ dataset: 2wikimhqa
 
     return {
         "qa_count": len(qa_pairs),
-        "paragraph_count": written,
-        "unique_titles": len(paragraphs),
+        "paragraph_count": len(written),
+        "article_paths": written,
+        "unique_titles": len({title for title, _ in paragraphs}),
     }
 
 
@@ -322,6 +286,7 @@ DATASET_PROCESSORS = {
 }
 
 
+# 【预处理 CLI】解析数据集和题数限制，调对应处理器生成 raw/articles 与 data/qa_pairs；已有同名输出可能被改写。
 def main():
     parser = argparse.ArgumentParser(
         description="Pre-process multi-hop QA datasets into Markdown articles."

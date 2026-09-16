@@ -22,6 +22,7 @@ from pathlib import Path
 DATASETS_DIR = Path(__file__).parent / "datasets"
 
 
+# 【数据下载】已有目标文件时复用，否则用 HTTP 下载 HotpotQA dev JSON；成功返回文件路径，失败返回 None。
 def download_hotpotqa(output_dir: Path):
     """Download the HotpotQA distractor dev set.
 
@@ -54,6 +55,7 @@ def download_hotpotqa(output_dir: Path):
         return None
 
 
+# 【数据下载】尝试获取 MuSiQue dev 数据并保存到目标目录；已有文件复用，失败打印手动获取提示并返回 None。
 def download_musique(output_dir: Path):
     """Download the MuSiQue-Ans dev set.
 
@@ -95,6 +97,7 @@ def download_musique(output_dir: Path):
         return None
 
 
+# 【数据下载】尝试获取 2Wiki dev JSON；已有文件复用，失败提示其他获取方式并返回 None。
 def download_2wikimhqa(output_dir: Path):
     """Download the 2WikiMultiHopQA dev set.
 
@@ -138,6 +141,7 @@ DATASET_DOWNLOADERS = {
 }
 
 
+# 【下载 CLI】指定 --dataset 时下载单个数据集，省略时下载全部；只获取数据，不预处理也不构建 wiki。
 def main():
     parser = argparse.ArgumentParser(description="Download multi-hop QA evaluation datasets")
     parser.add_argument("--dataset", "-d", choices=list(DATASET_DOWNLOADERS.keys()),
