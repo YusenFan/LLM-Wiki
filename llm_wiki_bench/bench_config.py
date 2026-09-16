@@ -82,9 +82,9 @@ INGEST_CONTRADICTION_EVERY = 9999
 
 # Fixed infrastructure directories present in every wiki.
 FIXED_DIRS = {
-    "sources":          {"description": "Source pages — paragraph digests and original archives"},
-    "sources/digests":  {"description": "Digest pages — structured summaries of source paragraphs"},
+    "sources":          {"description": "Processed article evidence"},
     "sources/articles": {"description": "Article archive — original source paragraph texts"},
+    "summaries":        {"description": "High-level summaries grouped by Related Pages"},
 }
 
 # Default page types used when LLM auto-init fails.
@@ -125,15 +125,16 @@ WIKI_LOG:      Path | None = None
 INGEST_LOG_DIR: Path | None = None
 
 
-def set_dataset(dataset_name: str) -> None:
+def set_dataset(dataset_name: str, wiki_dir: Path | None = None) -> None:
     """Activate a dataset: compute and create all wiki / raw / cache paths."""
     global _current_dataset, WIKI_DIR, CACHE_FILE, RAW_DIR
     global WIKI_INDEX, WIKI_OVERVIEW, WIKI_LOG, INGEST_LOG_DIR
 
     _current_dataset = dataset_name
-    WIKI_DIR   = BASE_DIR / "wiki_output" / dataset_name / "wiki"
+    WIKI_DIR   = Path(wiki_dir) if wiki_dir is not None else BASE_DIR / "wiki_output" / dataset_name / "wiki"
     RAW_DIR    = BASE_DIR / "raw"         / dataset_name / "articles"
-    CACHE_FILE = BASE_DIR / f".wiki-cache-bench-{dataset_name}.json"
+    CACHE_FILE = (WIKI_DIR / ".build-cache.json" if wiki_dir is not None
+                  else BASE_DIR / f".wiki-cache-bench-{dataset_name}.json")
 
     WIKI_DIR.mkdir(parents=True, exist_ok=True)
     WIKI_INDEX    = WIKI_DIR / "index.md"
@@ -280,7 +281,7 @@ def get_dir_catalog_text() -> str:
                 count = sum(
                     len([f for f in (WIKI_DIR / "sources" / sub).glob("*.md")
                          if f.name != "_index.md"])
-                    for sub in ("digests", "articles")
+                    for sub in ("articles",)
                     if (WIKI_DIR / "sources" / sub).exists()
                 )
             else:
@@ -466,7 +467,7 @@ def auto_init_page_types() -> None:
                 '{"page_types": {"<name>": {"description": "<name> — short desc"}}}\n'
                 "Rules: lowercase single-word English names; avoid catch-all names "
                 "(misc/other/general/uncategorized); do not redefine the reserved "
-                "names sources, syntheses."
+                "names sources, summaries, syntheses."
             ),
             user_prompt=f"## Articles\n{sample_text}\n",
             model=LLM_PREMIUM_MODEL,
@@ -481,6 +482,7 @@ def auto_init_page_types() -> None:
         name: {"description": (info.get("description", name) if isinstance(info, dict) else info),
                "auto_created": True}
         for name, info in raw_types.items()
-        if isinstance(info, (dict, str))
+        if isinstance(info, (dict, str)) and re.fullmatch(r"[a-z]+", name)
+        and name not in {"sources", "summaries", "syntheses"}
     }
     save_page_types(page_types if page_types else DEFAULT_PAGE_TYPES)

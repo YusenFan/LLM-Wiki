@@ -1,28 +1,8 @@
-"""Wiki retriever — implements the two paper-defined tools `wiki_search` and
-`wiki_read` over a compiled LLM-Wiki directory.
+"""Search Wiki navigation pages and read exact article evidence.
 
-The retrieval design follows the paper (§3.2):
-
-* **wiki_search(query, limit?)** — searches the Wiki index by *prioritizing
-  structured signals such as page names, aliases, tags, and descriptions
-  before falling back to page content*. It returns candidate pages and
-  metadata (no body text) for subsequent reading and traversal.
-* **wiki_read(paths)** — batch-reads directory indices (`_index.md`) or full
-  pages. For knowledge pages, the returned content includes inter-page
-  wikilinks that serve as traversal affordances for subsequent hops.
-
-Scoring (each query sub-token contributes its single highest field hit; all
-sub-token contributions are summed):
-
-    name exact         100
-    name substring      80
-    alias exact         90
-    alias substring     70
-    tag  exact/substr   50
-    description substr  40
-
-A BM25 score over (name + description + body) is added on top, capped so it
-cannot outrank a structural exact match.
+wiki_search returns metadata with optional layer and tag preferences.
+wiki_read opens knowledge/summary pages; source_read returns article ranges.
+The existing structured-field and BM25 scoring are retained.
 """
 
 from __future__ import annotations
@@ -35,6 +15,9 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
+
+from build_summaries import current_summaries
+from wiki_documents import ARTICLE_PREFIX, parse_document, read_article, wiki_path
 
 _logger = logging.getLogger("llm_wiki.retriever")
 
@@ -53,6 +36,12 @@ class WikiPage:
     tags: list[str] = field(default_factory=list)
     description: str = ""                            # one-line "> ..." blockquote
     links_to: list[str] = field(default_factory=list)  # [[wikilink]] targets
+
+    @property
+    def layer(self) -> str:
+        if self.rel_path.startswith(ARTICLE_PREFIX):
+            return "articles"
+        return "summaries" if self.dir_name == "summaries" else "knowledge"
 
 
 @dataclass
@@ -98,9 +87,23 @@ class WikiRetriever:
             self._loaded = True
             return
 
-        for md in self.wiki_dir.rglob("*.md"):
+        summaries = current_summaries(self.wiki_dir)
+        for md in sorted(self.wiki_dir.rglob("*.md")):
             rel = md.relative_to(self.wiki_dir)
             rel_str = str(rel)
+
+            if any(part.startswith(".") for part in rel.parts):
+                continue
+            if ((rel.parts[0] == "sources" and not rel_str.startswith(ARTICLE_PREFIX))
+                    or rel_str.startswith("syntheses/")):
+                continue
+            if rel_str.startswith("summaries/"):
+                if md.name == "_index.md":
+                    self.dir_indexes["summaries"] = "# Summaries\n" + "\n".join(
+                        f"- [[{p[:-3]}]]" for p in sorted(summaries))
+                    continue
+                if rel_str not in summaries:
+                    continue
 
             if md.name in ("index.md", "overview.md", "log.md"):
                 continue
@@ -115,6 +118,7 @@ class WikiRetriever:
                 continue
 
             try:
+                wiki_path(self.wiki_dir, rel_str)
                 text = md.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
                 continue
@@ -132,21 +136,14 @@ class WikiRetriever:
     def _parse_page(self, stem: str, rel: Path, text: str) -> WikiPage:
         dir_name = str(rel.parent) if str(rel.parent) != "." else ""
 
-        aliases: list[str] = []
-        tags: list[str] = []
+        metadata, body = parse_document(text)
+        aliases = metadata.get("aliases", [])
+        tags = metadata.get("tags", [])
+        aliases = [a for a in aliases if isinstance(a, str)] if isinstance(aliases, list) else []
+        tags = [t for t in tags if isinstance(t, str)] if isinstance(tags, list) else []
         description = ""
-        body = text
-
-        fm = re.match(r"^---\s*\n(.*?)\n---\s*\n", text, re.DOTALL)
-        if fm:
-            body = text[fm.end():]
-            block = fm.group(1)
-            am = re.search(r"aliases:\s*\[(.+?)\]", block)
-            if am:
-                aliases = [a.strip().strip("'\"") for a in am.group(1).split(",") if a.strip()]
-            tm = re.search(r"tags:\s*\[(.+?)\]", block)
-            if tm:
-                tags = [t.strip().strip("'\"") for t in tm.group(1).split(",") if t.strip()]
+        if str(rel).startswith(ARTICLE_PREFIX):
+            stem = str(metadata.get("title") or metadata.get("source_title") or stem)
 
         for line in body.strip().split("\n"):
             line = line.strip()
@@ -214,9 +211,14 @@ class WikiRetriever:
 
     # ── search ────────────────────────────────────────────────────────────
 
-    def search(self, query: str, limit: int = 10) -> list[SearchResult]:
+    def search(self, query: str, limit: int = 10, layer: str = "all",
+               tags: list[str] | None = None) -> list[SearchResult]:
         """Search by structured fields first, then fall back to page content (BM25)."""
         self.load()
+        if layer not in {"all", "summaries", "knowledge", "articles"}:
+            raise ValueError("unknown search layer")
+        if tags is not None and (not isinstance(tags, list) or any(not isinstance(t, str) for t in tags)):
+            raise ValueError("tags must be a list of strings")
         query = (query or "").strip()
         if not query:
             return []
@@ -228,6 +230,8 @@ class WikiRetriever:
         scored_paths: set[str] = set()
 
         for rp, page in self.pages.items():
+            if layer != "all" and page.layer != layer:
+                continue
             total = 0.0
             matched: set[str] = set()
             for w in sub_words:
@@ -241,6 +245,11 @@ class WikiRetriever:
                 total += min(bm25_s * self._BM25_WEIGHT, self._BM25_CAP)
                 matched.add("content")
 
+            # Tags add a preference; missing tags never exclude a text match.
+            if tags and {t.casefold() for t in tags} & {t.casefold() for t in page.tags}:
+                total += 50.0
+                matched.add("requested_tags")
+
             if total > 0:
                 results.append(SearchResult(page=page, score=total, matched_fields=sorted(matched)))
                 scored_paths.add(rp)
@@ -252,6 +261,8 @@ class WikiRetriever:
             page = self.pages.get(rp)
             if page is None:
                 continue
+            if layer != "all" and page.layer != layer:
+                continue
             results.append(SearchResult(
                 page=page,
                 score=min(bm25_s * self._BM25_WEIGHT, self._BM25_CAP),
@@ -259,7 +270,7 @@ class WikiRetriever:
             ))
 
         results.sort(key=lambda r: r.score, reverse=True)
-        return results[:limit]
+        return results[:max(0, limit)]
 
     @staticmethod
     def _score_word(word: str, page: WikiPage) -> tuple[float, set[str]]:
@@ -310,15 +321,25 @@ class WikiRetriever:
         self.load()
         out: list[dict] = []
         for raw in paths:
-            p = (raw or "").strip()
+            p = (raw or "").strip().removeprefix("[[").removesuffix("]]")
+            p = p.split("|", 1)[0].split("#", 1)[0]
+            if p + ".md" in self.pages:
+                p += ".md"
             if p == "/":
                 out.append({"path": "/", "type": "root", "dirs": sorted(self.dir_indexes.keys())})
                 continue
 
+            if p.endswith("/_index.md"):
+                p = p[:-len("/_index.md")]
             if p.endswith(".md"):
                 page = self.pages.get(p)
                 if page is None:
                     out.append({"path": p, "type": "error", "error": "not found"})
+                    continue
+                if page.layer == "articles":
+                    out.append({"path": p, "type": "article", "name": page.name,
+                                "total_lines": len(page.text.splitlines()),
+                                "instruction": "Use source_read(article, start_line, end_line) for evidence."})
                     continue
                 out.append({
                     "path": p,
@@ -330,6 +351,7 @@ class WikiRetriever:
                         "tags": page.tags,
                         "description": page.description,
                         "links_to": page.links_to,
+                        "layer": page.layer,
                     },
                 })
                 continue
@@ -349,6 +371,20 @@ class WikiRetriever:
         return out
 
     # ── helpers ───────────────────────────────────────────────────────────
+
+    def source_read(self, article: str, start_line: int = 1, end_line: int | None = None) -> dict:
+        """Read bounded article passages and retain the version observed by the agent."""
+        self.load()
+        if article not in self.pages or self.pages[article].layer != "articles":
+            raise ValueError("article not found")
+        if type(start_line) is not int:
+            raise ValueError("start_line must be an integer")
+        total = len(self.pages[article].text.splitlines())
+        if end_line is None:
+            end_line = min(total, start_line + 79)
+        if type(end_line) is not int or end_line - start_line >= 200:
+            raise ValueError("read at most 200 lines per call")
+        return read_article(self.wiki_dir, article, start_line, end_line)
 
     def wiki_map(self) -> str:
         """A short, agent-facing overview of the Wiki layout."""
@@ -376,6 +412,8 @@ class WikiRetriever:
             results = self.search(
                 arguments.get("query", ""),
                 limit=min(int(arguments.get("limit", 10)), 50),
+                layer=arguments.get("layer", "all"),
+                tags=arguments.get("tags"),
             )
             payload = {
                 "matched": len(results),
@@ -389,6 +427,7 @@ class WikiRetriever:
                             "aliases": r.page.aliases,
                             "tags": r.page.tags,
                             "description": r.page.description,
+                            "layer": r.page.layer,
                         },
                     }
                     for r in results
@@ -399,6 +438,11 @@ class WikiRetriever:
         if name == "wiki_read":
             return json.dumps(self.read(arguments.get("paths") or arguments.get("dirs") or []),
                               ensure_ascii=False)
+
+        if name == "source_read":
+            return json.dumps(self.source_read(arguments.get("article", ""),
+                                               arguments.get("start_line", 1),
+                                               arguments.get("end_line")), ensure_ascii=False)
 
         return json.dumps({"error": f"unknown tool: {name}"})
 
@@ -420,6 +464,10 @@ WIKI_TOOL_SCHEMAS: list[dict] = [
                 "properties": {
                     "query": {"type": "string", "description": "Search query."},
                     "limit": {"type": "integer", "description": "Max results to return (default 10)."},
+                    "layer": {"type": "string", "enum": ["all", "summaries", "knowledge", "articles"],
+                              "description": "Prefer summaries for navigation; all preserves direct access."},
+                    "tags": {"type": "array", "items": {"type": "string"},
+                             "description": "Optional ranking preference, never a hard filter."},
                 },
                 "required": ["query"],
             },
@@ -451,3 +499,20 @@ WIKI_TOOL_SCHEMAS: list[dict] = [
         },
     },
 ]
+
+WIKI_TOOL_SCHEMAS.append({
+    "type": "function",
+    "function": {
+        "name": "source_read",
+        "description": "Read exact article lines as final evidence. Follow #Lx-Ly references from knowledge pages; read evidence for every hop.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "article": {"type": "string", "description": "sources/articles/...md path"},
+                "start_line": {"type": "integer", "description": "1-based inclusive start (default 1)"},
+                "end_line": {"type": "integer", "description": "Inclusive end; at most 200 lines per call"},
+            },
+            "required": ["article"],
+        },
+    },
+})

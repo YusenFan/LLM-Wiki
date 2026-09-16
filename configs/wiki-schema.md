@@ -1,124 +1,121 @@
-# Wiki Schema — Structured Knowledge Base
+# Wiki schema: article evidence and related-page summaries
 
-## Directory layout
+The evidence chain ends at the **processed article**:
 
-Page types are declared in `wiki/page_types.yaml`. On first ingestion the LLM
-analyses a sample of source articles and proposes a per-corpus directory
-schema; you can also set it manually.
-
-**Fixed infrastructure directories:**
-
-```
-wiki/
-├── sources/               # source-page root
-│   ├── digests/           #   structured summaries of source paragraphs
-│   └── articles/          #   verbatim copies of the original source text
-├── syntheses/             # distilled query-result pages
-├── index.md               # listing of directories with descriptions + page counts
-├── overview.md            # global overview (regenerated periodically)
-├── log.md                 # append-only operation log
-└── page_types.yaml        # registry of page types
+```text
+summaries/ (navigation, tags, member knowledge pages)
+    → knowledge pages (facts, explained Related Pages)
+        → sources/articles/ (direct article links)
 ```
 
-**Dynamic page-type directories** (defined in `page_types.yaml`, generated on
-first ingestion; one per corpus):
+## Directories
 
-```
-wiki/
-├── {type_a}/              # e.g. entities/, events/, concepts/, relations/
-├── {type_b}/
-└── {type_c}/              # exact names and descriptions vary per corpus
-```
+- `sources/articles/<sha256>.md`: byte-for-byte copies of processed articles.
+  The filename is the full content hash; changed text creates a different file.
+- Knowledge directories declared in `page_types.yaml`: e.g. `entities/`,
+  `concepts/`, `events/`, `relations/`.
+- `summaries/<member-set-hash>.md`: one level of high-level navigation summaries.
+- `_index.md` files and root `index.md`: deterministic navigation lists.
 
-## Frontmatter
+`sources`, `summaries`, and `syntheses` are reserved names. No new digest pages
+are generated. Article evidence does not need a link to pre-article raw material.
 
-```yaml
----
-type: source|synthesis|{dynamic_type}
-aliases: [list of aliases / variant names]
-tags: [list of tags]
----
-```
+## Knowledge pages
 
-> `type` matches the directory name.
-> `aliases` is used at retrieval time — list common aliases, foreign names and
-> alternative translations.
-> `created` and `updated` are injected by the engine; the LLM does not need to
-> emit them.
-
-### Generic knowledge-page template (`{dir}/`)
+Python renders the page from a validated JSON proposal:
 
 ```markdown
 ---
-type: {dir}
-aliases: [aliases]
-tags: [tags]
+type: entities
+schema: article-evidence-v1
+aliases: [A]
+tags: [history]
 ---
 
-# Page title
+# Alpha
 
-## Basic info
-- Key attribute 1:
-- Key attribute 2:
+> Alpha and its organization
 
-## Core facts
-- Fact 1 (use full noun phrases — avoid pronouns)
-- Fact 2
+## Core Facts
+- Alpha founded Beta. [[sources/articles/<sha256>]]
 
-## Related pages
-- [[dir/page]] — relationship description
+## Related Pages
+- [[entities/beta]] — organization founded by Alpha
 
-## Related sources
-- [[sources/digests/YYYY-MM-DD-slug]] — what this source contributes
+## Related Sources
+- [[sources/articles/<sha256>]]
 ```
 
-### Source-digest template (`sources/digests/`)
+Every fact has at least one article citation. Citation input includes only the
+`.md` article path. Python checks that it resolves to a nonempty archived article
+and that its content matches its hash. The model does not choose a fragment,
+count line numbers, or reproduce a quote during knowledge-page generation.
+Python reads the actual article content; it never persists model-written quotes
+as source text. Existing line-range links remain readable for compatibility.
 
-> All five sections below are **mandatory** — write them even when the
-> source paragraph is short.
+Related Pages can have zero, one or many reliable links. Each target must be an
+existing knowledge page or a knowledge page created in the same batch; each link
+has a short relationship description. Do not manufacture links to meet a quota.
+
+## Summary grouping
+
+For every knowledge page, take `{itself} ∪ {existing Related Pages targets}`.
+Only explicit Related Pages entries with relationship descriptions participate.
+Articles, summaries, indexes and other links do not participate.
+
+1. Ignore singleton sets.
+2. Deduplicate identical sets regardless of member order.
+3. Remove a set if it is a strict subset of **one** other candidate set.
+4. Keep overlapping sets when neither contains the other.
+5. Do not compute connected components or require a second topic classifier.
+
+Example: retain `{A,B,C}` and `{A,B,D}`; omit `{A,B}`. If only A and B link to
+each other, produce one `{A,B}` summary. Coverage by a union of several groups
+is not sufficient to remove another group.
+
+## Summary pages
 
 ```markdown
 ---
-type: source
-source_date: YYYY-MM-DD
-source_article: <source file stem, without path prefix or .md extension>
-tags: [tags]
+type: summary
+schema: related-summary-v1
+tags: [history, organizations]
+members: [entities/alpha.md, entities/beta.md]
+fingerprint: <hash of member paths and current content>
 ---
 
-# Source title
+# Alpha and Beta
 
-> Source: {origin} | {date}
+> Founding and location
 
-## Summary
-A summary of at most 200 words. (required)
+A high-level overview of the supplied knowledge pages.
 
-## Core claims
-- Author/origin asserts that … (judgements/opinions, not just encyclopedic facts) (required)
+## Member Pages
+- [[entities/alpha]]
+- [[entities/beta]]
 
-## Key quotes
-- "Direct quotation from the source." — speaker, if applicable (required, ≥1)
-
-## Key facts
-- Fact 1
-- Fact 2
-(required, ≥2)
-
-## Mentioned entities
-- [[entity name]]
-(required, ≥1)
+Navigation only. Verify final claims in the cited article passages.
 ```
 
-## Writing style (the wiki is consumed by an LLM for retrieval)
+Python owns membership and deduplication. The LLM writes title, description,
+tags and overview. A small fingerprint check avoids serving a cached summary
+when its membership or member contents have changed; no history/repair agent
+is introduced. Obsolete files may remain on disk but are excluded from retrieval
+and regenerated summary indexes.
 
-- **Information density first.** Prefer structured fact lists over prose paragraphs.
-- **Use full noun phrases.** Avoid pronouns ("he", "it") — they break entity matching.
-- **Informative headings.** Use "Life and style" rather than "About"; "Structural analysis" rather than "Closer look".
-- **Always declare aliases.** Common nicknames, foreign-language names and alternative spellings go into the frontmatter `aliases` field.
-- **Link sources by full path.** `[[sources/digests/YYYY-MM-DD-slug]]`.
+## QA contract
 
-## Naming conventions
+- `wiki_search(query, layer?, tags?)` supports `all`, `summaries`, `knowledge`,
+  and `articles`; tags are a ranking preference, never an exclusion rule.
+- `wiki_read(paths)` opens navigation pages. For an article it returns the path
+  and line count, prompting `source_read` rather than treating navigation as proof.
+- `source_read(article, start_line, end_line)` returns actual article lines and
+  the version read. A call reads up to 200 lines, with an 80-line default window.
+- The answer step receives only article passages actually read. It returns a
+  short answer plus `evidence_chain`, with cited passages for each factual hop.
+- Python verifies that citations lie inside read passages with matching versions
+  and exact quotes. Missing or invalid evidence produces `unknown`.
 
-- Knowledge pages: use the canonical English page name (e.g. `Tan_Dun.md`).
-- Source digest pages: `YYYY-MM-DD-slug.md` under `sources/digests/`.
-- Avoid filesystem-unsafe characters: `/` → `-`, `"` → removed, `|` → `-`.
-- Wiki links use `[[page]]` syntax (no `.md` extension).
+Valid ranges and exact quotes establish provenance. They do **not** establish
+that the source entails the claim, or that the model listed every necessary hop.
+Those remain semantic judgments requiring evaluation.

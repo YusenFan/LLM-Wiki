@@ -77,7 +77,8 @@ def step_preprocess(dataset: str, limit: int | None = None) -> bool:
     return True
 
 
-def step_ingest(dataset: str, batch_size: int = 3, force: bool = False) -> bool:
+def step_ingest(dataset: str, batch_size: int = 3, force: bool = False,
+                wiki_dir: Path | None = None) -> bool:
     """Build the wiki by ingesting all preprocessed articles."""
     import bench_config as config
     import bench_ingest
@@ -86,7 +87,7 @@ def step_ingest(dataset: str, batch_size: int = 3, force: bool = False) -> bool:
     print(f"  [3/3] Ingest articles into wiki: {dataset}")
     print(f"{'='*60}")
 
-    config.set_dataset(dataset)
+    config.set_dataset(dataset, wiki_dir=wiki_dir)
     config.ensure_wiki_dirs()
 
     raw_dir = config.RAW_DIR
@@ -102,8 +103,8 @@ def step_ingest(dataset: str, batch_size: int = 3, force: bool = False) -> bool:
     print(f"  📂 Articles: {len(article_paths)}")
     print(f"  📁 Wiki output: {config.WIKI_DIR}")
 
-    bench_ingest.ingest_batch(article_paths, batch_size=batch_size, force=force)
-    return True
+    stats = bench_ingest.ingest_batch(article_paths, batch_size=batch_size, force=force)
+    return stats["failed"] == 0 and stats["summaries"]["failed"] == 0
 
 
 def run_one(dataset: str, args) -> bool:
@@ -118,7 +119,7 @@ def run_one(dataset: str, args) -> bool:
     if args.only_ingest or args.only is None or args.only == "ingest":
         if ok:
             ok = ok and step_ingest(
-                dataset, batch_size=args.batch_size, force=args.force
+                dataset, batch_size=args.batch_size, force=args.force, wiki_dir=args.wiki_dir
             )
     print(f"\n  ⏱  Total time for {dataset}: {time.time() - t0:.1f}s")
     return ok
@@ -141,6 +142,7 @@ def main():
                         help="Ingest batch size (articles per LLM call group).")
     parser.add_argument("--force", action="store_true",
                         help="Re-ingest articles even if cached.")
+    parser.add_argument("--wiki-dir", type=Path, help="Build into a separate wiki directory and cache.")
 
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--skip-preprocess", action="store_true")
@@ -165,6 +167,8 @@ def main():
 
     if not args.dataset and not args.all:
         parser.error("Specify --dataset DATASET or --all.")
+    if args.all and args.wiki_dir:
+        parser.error("--wiki-dir requires a single dataset; do not combine it with --all.")
 
     datasets = ["hotpotqa", "musique", "2wikimhqa"] if args.all else [args.dataset]
     overall_ok = True
