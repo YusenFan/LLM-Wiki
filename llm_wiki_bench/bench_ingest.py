@@ -49,6 +49,7 @@ if not _logger.handlers:
 
 # ─── Utility functions ───
 
+# 【旧流程辅助】读取指定文件并截到 max_len；不存在或失败用提示字符串代替，当前构建循环不调用。
 def _read_file_safe(path: Path, max_len: int = 5000) -> str:
     if path and path.exists():
         try:
@@ -66,6 +67,7 @@ MAX_INDEX_TOTAL_CHARS = 100000  # ~25K tokens; leaves room for the rest of the p
 MAX_TOTAL_PROMPT_CHARS = 500000  # ~125K tokens; safe for models with a 200K-token context window.
 
 
+# 【旧提示词裁剪】超总字符预算时依次裁掉页面名、页面正文、目录索引尾部；这是字符启发式，不是精确 token 控制。
 def _apply_prompt_safety_valve(system: str, user: str) -> tuple[str, str]:
     """Total-prompt safety valve: when system+user exceeds MAX_TOTAL_PROMPT_CHARS,
     progressively trim the largest sections of the user prompt so we stay within
@@ -91,6 +93,7 @@ def _apply_prompt_safety_valve(system: str, user: str) -> tuple[str, str]:
     idx_content = user.find(marker_content)
     idx_indexes = user.find(marker_indexes)
 
+    # 【旧局部辅助】查找给定提示词章节之后的下一个二级标题位置，用于裁剪章节。
     def _find_section_end(text: str, start: int) -> int:
         """Find the end of the section starting at ``start`` (i.e. the line before the next ``## ``)."""
         line_end = text.find("\n", start)
@@ -143,6 +146,7 @@ _CAND_CJK_RE = re.compile(r"[\u4e00-\u9fa5]{2,15}")
 _CAND_LATIN_RE = re.compile(r"\b[A-Z][A-Za-z.\-]{1,30}\b")
 
 
+# 【旧候选评分】用标题词与目录索引的匹配密度及目录名称匹配评分，仅用于超预算索引裁剪；不是当前 BM25。
 def _compute_index_relevance(dir_name: str, content: str, title_keywords: set) -> float:
     """Score the relevance between a directory and an article title (normalized density + name match)."""
     score = 0.0
@@ -162,6 +166,7 @@ def _compute_index_relevance(dir_name: str, content: str, title_keywords: set) -
     return score
 
 
+# 【旧提示词材料】读取目录 _index.md，总长超预算时按文章标题相关性删减；当前入口不依赖这些索引选页。
 def _get_all_index_content(source_title: str = "") -> dict[str, str]:
     """Read every directory's _index.md; when their total exceeds the budget,
     trim the lower-relevance ones first.
@@ -222,6 +227,7 @@ def _get_all_index_content(source_title: str = "") -> dict[str, str]:
     return result
 
 
+# 【旧提示词材料】从第一步选中的页推导需展开的目录白名单；没有选页返回 None 表示全展开。
 def _expand_dirs_from_selected(selected_pages: list[str] | None) -> set[str] | None:
     """Derive the directory whitelist that Step 2 must fully expand,
     based on the pages selected in Step 1.
@@ -245,6 +251,7 @@ def _expand_dirs_from_selected(selected_pages: list[str] | None) -> set[str] | N
     return dirs
 
 
+# 【旧名称启发式】用中文连续片段和英文大写词提取候选专名，仅辅助别名裁剪，不做实体识别模型调用。
 def _extract_candidate_names(articles: list[dict]) -> set[str]:
     """Extract candidate proper nouns from the title and body, used for Level-2 alias pruning.
 
@@ -266,6 +273,7 @@ def _extract_candidate_names(articles: list[dict]) -> set[str]:
     return names
 
 
+# 【旧提示词材料】列出既有页名，按目录白名单和候选专名决定是否展开页面及别名，降低输入长度。
 def _get_existing_page_names(expand_dirs: set[str] | None = None,
                              hot_names: set[str] | None = None) -> str:
     """Return the list of existing page names with three-level trimming support.
@@ -325,6 +333,7 @@ def _get_existing_page_names(expand_dirs: set[str] | None = None,
 
 # ─── Step 1 prompt: page selection + noise filtering ───
 
+# 【旧提示词构造】组合单篇文章与目录索引，要求模型返回待看页面；本函数只返回提示词，调用模型由旧主流程负责。
 def build_select_pages_prompt(source_title: str, source_content: str) -> tuple[str, str]:
     """Step 1: Let LLM read the full source paragraph + directory indexes,
     select which existing Wiki pages need to be viewed/updated."""
@@ -402,6 +411,7 @@ Notes:
 
 # ─── Step 1 prompt (batch mode): page selection ───
 
+# 【旧提示词构造】为多篇文章构造共享选页提示词；模型返回批次共用页面集合，不是逐篇独立搜索。
 def build_select_pages_batch_prompt(articles: list[dict]) -> tuple[str, str]:
     """Step 1 batch version: multiple paragraphs at once."""
 
@@ -458,6 +468,7 @@ Notes:
 
 # ─── Step 2 prompt (single): generate wiki pages ───
 
+# 【旧提示词构造】拼 purpose、schema、文章及已选页正文，要求生成整页 FILE 块；不用于当前事实工具构建。
 def build_ingest_prompt(source_title: str, source_time: str, source_content: str,
                         existing_pages_content: str = "", source_type: str = "wikipedia",
                         selected_pages: list[str] | None = None) -> tuple[str, str]:
@@ -624,6 +635,7 @@ tags: [physicist, Nobel laureate]
 
 # ─── Step 2 prompt (batch): generate wiki pages ───
 
+# 【旧提示词构造】批量拼接文章与已读页面，要求一次生成多个文件及目录变更；与当前逐文档工具循环不同。
 def build_ingest_prompt_batch(articles: list[dict], existing_pages_content: str = "",
                               selected_pages: list[str] | None = None) -> tuple[str, str]:
     """Build English ingestion prompt for multiple source paragraphs."""
@@ -747,6 +759,7 @@ Only output if truly needed. Most of the time, no changes are necessary.
     return _apply_prompt_safety_valve(system, user)
 
 
+# 【旧路径辅助】按标题清洗规则预测文章文件名，供旧 digest 关联使用；不提供来源身份保证。
 def _predict_article_stem(title: str) -> str:
     """Predict the article stem for a source paragraph."""
     safe_title = re.sub(r'[<>:"/\\|?*\[\]]', '', title)[:60].strip()
@@ -758,6 +771,7 @@ def _predict_article_stem(title: str) -> str:
 
 # ─── Validation and post-processing helpers ───
 
+# 【旧名称清洗】统一全半角、空白等文件名字符，返回规范名称；不判断实体是否相同。
 def _normalize_filename(filename: str) -> str:
     """Normalize filenames: unify whitespace and full/half-width characters."""
     result = []
@@ -775,6 +789,7 @@ def _normalize_filename(filename: str) -> str:
     return name
 
 
+# 【旧元数据改写】清理逗号和列表形式、去 confidence 并重排字段；供旧整页写入使用。
 def _sanitize_frontmatter(content: str) -> str:
     """Clean up frontmatter:
     - Convert full-width commas in tags/aliases to ASCII commas.
@@ -835,6 +850,7 @@ def _sanitize_frontmatter(content: str) -> str:
     return f"---\n{chr(10).join(final_lines)}\n---{body}"
 
 
+# 【旧元数据读取】从页面 frontmatter 抽取 type，供旧写入器决定目录。
 def _extract_type_from_content(content: str) -> str:
     """Extract the ``type`` field from frontmatter."""
     if not content.startswith("---"):
@@ -849,6 +865,7 @@ def _extract_type_from_content(content: str) -> str:
     return ""
 
 
+# 【旧完整性检查】判断 frontmatter 是否闭合，帮助拒绝模型截断的文件；不验证正文事实完整。
 def _check_frontmatter_complete(content: str, rel_path: str) -> bool:
     """Check whether the frontmatter block is complete (not truncated)."""
     if not content.startswith("---"):
@@ -868,6 +885,7 @@ def _check_frontmatter_complete(content: str, rel_path: str) -> bool:
 _DIGEST_REQUIRED_SECTIONS = ["Summary", "Key Facts", "Key Entities", "Related Context"]
 
 
+# 【旧摘要修补】检查 digest 必要章节并为缺失项补占位内容；有章节不等于有真实证据。
 def _check_digest_completeness(content: str, rel_path: str) -> str:
     """Validate digest pages; auto-insert placeholders for missing required sections."""
     result = config.split_frontmatter(content)
@@ -942,6 +960,7 @@ def _check_digest_completeness(content: str, rel_path: str) -> str:
     return f"---\n{fm_text}\n---{new_body}"
 
 
+# 【旧元数据改写】向页面注入 created/updated 日期；这是编辑日期，不是事实发生时间。
 def _inject_dates(content: str, file_exists: bool, existing_path=None) -> str:
     """Inject created/updated dates into the frontmatter."""
     if not content.startswith("---"):
@@ -994,6 +1013,7 @@ def _inject_dates(content: str, file_exists: bool, existing_path=None) -> str:
     return f"---\n{chr(10).join(new_lines)}\n---{body}"
 
 
+# 【旧模糊匹配】动态规划计算两字符串最长公共子序列长度，供文章名近似匹配。
 def _lcs_len(a: str, b: str) -> int:
     """Return the longest-common-subsequence length between two strings."""
     m, n = len(a), len(b)
@@ -1009,6 +1029,7 @@ def _lcs_len(a: str, b: str) -> int:
     return prev[n]
 
 
+# 【旧来源猜测】在候选文件名中选近似文章名；属于旧启发式，不能替代当前明确 source_id/version_id。
 def _fuzzy_match_article(title_part: str, candidates: list[str]) -> str | None:
     """Fuzzy-match the best article stem from a candidate list."""
     if len(candidates) == 1:
@@ -1027,6 +1048,7 @@ def _fuzzy_match_article(title_part: str, candidates: list[str]) -> str | None:
     return best_match if best_score >= 0.2 else None
 
 
+# 【旧关联写盘】为新 digest 猜配并写 source_article 与 Original 链接；当前事实提交不用此模糊关联。
 def _inject_article_link_to_digests(article_stems: list[str]):
     """Inject the original-article link into freshly ingested digests (source_article field + ## Original section)."""
     if not article_stems:
@@ -1085,6 +1107,7 @@ def _inject_article_link_to_digests(article_stems: list[str]):
         print(f"  🔗 Article link injection: {', '.join(parts)}")
 
 
+# 【旧链接修复】检查并修正 digest 内的 sources/articles 链接；会改写旧页面。
 def _fix_digest_article_links():
     """Fix [[sources/articles/...]] links inside digest files."""
     wiki_dir = config.WIKI_DIR
@@ -1138,6 +1161,7 @@ def _fix_digest_article_links():
     return fixed_count
 
 
+# 【旧索引写盘】扫描旧 articles/digests，程序化重建来源目录索引；当前实时检索不依赖它。
 def _rebuild_sources_index():
     """Rebuild the sources/ indexes programmatically."""
     wiki_dir = config.WIKI_DIR
@@ -1230,6 +1254,7 @@ See [articles/_index.md](articles/_index.md) for article archive index.
     sources_idx.write_text(sources_idx_content, encoding="utf-8")
 
 
+# 【旧全局索引】重建 index.md 目录统计；update_overview=True 时还请求模型概览，否则保留旧概览。
 def _rebuild_global_index(update_overview: bool = False):
     """Regenerate the top-level index.md (knowledge overview + directory overview).
 
@@ -1269,6 +1294,7 @@ def _rebuild_global_index(update_overview: bool = False):
     index_path.write_text("\n".join(parts), encoding="utf-8")
 
 
+# 【旧文本解析】从 index.md 提取已有知识概览文字，不调用模型。
 def _extract_existing_overview(existing_index: str) -> str:
     """Extract the previous knowledge-overview text from index.md (no LLM call)."""
     if "> **Knowledge Overview**" not in existing_index:
@@ -1279,6 +1305,7 @@ def _extract_existing_overview(existing_index: str) -> str:
     return ""
 
 
+# 【旧概览／LLM】汇集现有知识材料，让模型生成全库概览文字；当前 QA 入口使用实时树而非该概览。
 def _generate_overview_text(existing_index: str, dir_catalog: str) -> str:
     """Ask the LLM to write a cross-source knowledge overview.
 
@@ -1338,6 +1365,7 @@ _CONTENT_FIX_EVERY = 60
 _CONSOLIDATE_EVERY = 180
 
 
+# 【旧统计】统计配置知识目录的页面数，排除 sources；不运行检索或模型。
 def _count_knowledge_pages() -> int:
     """Count current knowledge pages (excluding ``sources``)."""
     wiki_dir = config.WIKI_DIR
@@ -1352,6 +1380,7 @@ def _count_knowledge_pages() -> int:
     return count
 
 
+# 【旧结构检查】扫描断链、索引一致性、类型目录、digest 完整度和重复页等，返回问题分类；不能代替当前来源版本／受控事实审计。
 def quick_lint_bench() -> dict:
     """Lightweight lint pass (pure code checks; no WikiGraph dependency).
 
@@ -1714,6 +1743,7 @@ def quick_lint_bench() -> dict:
     return issues
 
 
+# 【旧自动改写】按启发式修链接、目录、索引和页面格式，部分分支删链接或文件；不调用 LLM，但也不是当前 FactStore 的增量写入规则。
 def auto_fix_bench():
     """Full auto-fix pass (pure code, no LLM).
 
@@ -2255,6 +2285,7 @@ def auto_fix_bench():
 
 
 
+# 【旧修复／LLM】扫描缺章节或只有占位符的 digest，用旧原文补生成内容并写回。
 def llm_fix_incomplete_digests() -> int:
     """Use the LLM to complete incomplete digest pages.
 
@@ -2410,6 +2441,7 @@ Only output sections that need to be added (starting with ##), do not output exi
     return fixed
 
 
+# 【旧修复／LLM】为缺少标题后 blockquote 概览的知识页生成一句摘要并写回。
 def llm_fix_missing_summary() -> int:
     """Use the LLM to add a one-sentence blockquote summary to knowledge pages.
 
@@ -2502,6 +2534,7 @@ Example: > Baroque-era German composer, father of modern Western music"""
     return fixed
 
 
+# 【旧修复／LLM】为知识页补 Key Facts、Related Pages 等必要章节，改写旧页面。
 def llm_fix_missing_sections() -> int:
     """Use the LLM to fill in required sections (Key Facts / Related Pages) on knowledge pages."""
     wiki_dir = config.WIKI_DIR
@@ -2638,6 +2671,7 @@ Only output sections that need to be added (starting with ##)."""
     return fixed
 
 
+# 【旧修复／LLM】用共同 digest、标签和反向链接预选候选，再让模型挑关联页并写 Related Pages。
 def llm_fix_empty_related_pages(batch_size: int = 10, max_pages: int = 0) -> int:
     """Repair knowledge pages with empty "Related Pages" using code pre-matching + LLM selection.
 
@@ -2936,6 +2970,7 @@ def llm_fix_empty_related_pages(batch_size: int = 10, max_pages: int = 0) -> int
     return fixed
 
 
+# 【旧章节写盘】把模型选定的链接列表写进 Related Pages，返回修补结果；不验证关系事实的原文范围。
 def _write_related_pages(page_stem: str, link_lines: list, all_pages: dict):
     """Write the LLM-selected Related Pages links back into the knowledge page."""
     info = all_pages.get(page_stem)
@@ -3003,6 +3038,7 @@ def _write_related_pages(page_stem: str, link_lines: list, all_pages: dict):
     page_path.write_text(new_text, encoding="utf-8")
 
 
+# 【旧反向关联】扫描 digest 是否提及页名或别名，把匹配项写成 Related Sources；名称共现不是严格来源证据。
 def _inject_related_sources_for_page(page_path: Path, page_name: str):
     """Reverse-match digests for a single knowledge page and inject Related Sources links.
 
@@ -3081,6 +3117,7 @@ def _inject_related_sources_for_page(page_path: Path, page_name: str):
         print(f"    📎 Injected Related Sources for {page_name}")
 
 
+# 【旧修复／LLM】从 Error Book 取未修复断链，让模型创建缺失知识页并更新修复状态；当前构建不自动调用。
 def llm_fix_broken_links() -> int:
     """Read broken-link records from the error book and have the LLM create the missing knowledge pages in batches.
 
@@ -3261,6 +3298,7 @@ Output format:
     return fixed
 
 
+# 【旧抽样核验／LLM】随机抽知识页，以其来源 digest 检查 Key Facts 并标记／移除不支持的内容；不是逐条不可变原文校验。
 def llm_verify_source_grounding(sample_size: int = 30) -> int:
     """Layer 2: spot-check whether Key Facts on knowledge pages are supported by sources (unsupported-fact detection and repair).
 
@@ -3430,6 +3468,7 @@ Output JSON format:
     return removed_count
 
 
+# 【旧抽样核验／LLM】抽页面及 Related Pages 检查矛盾，参考 digest 修正内容；不等同当前保留 conflicts_with 的事实追加机制。
 def llm_detect_contradictions(sample_size: int = 10) -> int:
     """Layer 2: sample-detect cross-page contradictions.
 
@@ -3588,6 +3627,7 @@ If no contradictions found, return {{"has_contradiction": false, "contradictions
     return fixed_count
 
 
+# 【旧修复编排／LLM】汇总 digest、概览、章节、断链和关联页补全步骤，返回各类修复数量。
 def llm_fix_structural() -> dict:
     """Run structural LLM repairs and return per-step counts.
 
@@ -3622,6 +3662,7 @@ def llm_fix_structural() -> dict:
     return results
 
 
+# 【旧修复编排／LLM】运行来源支持抽检与跨页矛盾检查，返回修复计数。
 def llm_fix_content() -> dict:
     """Run content-level LLM repairs and return per-step counts.
 
@@ -3649,6 +3690,7 @@ def llm_fix_content() -> dict:
     return results
 
 
+# 【旧修复编排／LLM】合并结构与内容修复结果，供旧 finalize 等入口使用。
 def llm_fix_all() -> dict:
     """Run every LLM repair (structural + content-level) and return per-step counts.
 
@@ -3660,6 +3702,7 @@ def llm_fix_all() -> dict:
     return results
 
 
+# 【旧合并／LLM】从目录索引识别疑似重复页面并让模型合并，可能改写／删除页面；当前事实流程不自动调用。
 def merge_duplicate_pages():
     """Scan each directory's _index.md and have the LLM detect mergeable duplicate pages.
 
@@ -3903,6 +3946,7 @@ Notes:
         print(f"    ✅ Merged {merged_count} duplicate page groups")
 
 
+# 【旧合并辅助】扫描同目录别名重叠并处理候选冲突；别名重叠不是当前实体身份校验依据。
 def detect_alias_overlaps():
     """Detect page pairs in the same directory whose aliases overlap, then repair them automatically.
 
@@ -3998,6 +4042,7 @@ def detect_alias_overlaps():
         print(f"    ✅ Fixed {fixed_count} alias overlaps")
 
 
+# 【旧概览／LLM】生成全库知识概览并更新 index.md，曾作零跳上下文；当前 Agent 起点是 tree。
 def generate_overview():
     """Have the LLM produce a knowledge overview placed at the top of index.md.
 
@@ -4071,6 +4116,7 @@ Output only the overview text, no title, no markdown formatting."""
 
 
 
+# 【旧索引解析】把 _index.md 拆为章节标题与条目列表，标题之前内容存 __preamble__。
 def _parse_index_sections(text: str) -> list[tuple[str, list[str]]]:
     """Parse _index.md into [(section_header_line, [item_line, ...]), ...].
     Non-`## ` content (e.g. the file-top `# title` and `> description`) is
@@ -4091,6 +4137,7 @@ def _parse_index_sections(text: str) -> list[tuple[str, list[str]]]:
     return sections
 
 
+# 【旧索引序列化】将已解析的章节及条目重新拼为 Markdown 文本。
 def _assemble_sections(sections: list[tuple[str, list[str]]]) -> str:
     """Reassemble parsed sections back into text."""
     parts: list[str] = []
@@ -4106,6 +4153,7 @@ def _assemble_sections(sections: list[tuple[str, list[str]]]) -> str:
     return "\n".join(parts).rstrip() + "\n"
 
 
+# 【旧索引解析】从列表 wikilink 中提取页面名称，供章节归类使用。
 def _extract_entry_name(entry_line: str) -> str:
     """Extract the page name from a ``- [[page-name]] ...`` line."""
     m = re.match(r'\s*-\s*\[\[([^\]|#]+)', entry_line)
@@ -4115,6 +4163,7 @@ def _extract_entry_name(entry_line: str) -> str:
     return name.rsplit("/", 1)[-1]
 
 
+# 【旧分类／LLM】让模型把 Unsorted 条目归到既有或新章节，随后改写索引；force_final 控制末轮兜底归类。
 def relocate_pending_entries(dry_run: bool = False, batch_size: int = 40,
                              force_final: bool = False) -> dict:
     """Move entries from each directory's "## Unsorted" section into existing sections (or propose new sections).
@@ -4419,6 +4468,7 @@ Rules:
     return summary
 
 
+# 【旧目录整理／LLM】检查目录规模，超阈值时请求拆分／合并／迁移建议并执行；返回 skipped/no_changes/executed。
 def consolidate_wiki_bench(total_ingested: int = 0) -> dict:
     """Have the LLM audit the directory structure and propose splits/merges/moves, then execute them.
 
@@ -4558,6 +4608,7 @@ Notes:
         return {"status": "error", "error": str(e)}
 
 
+# 【旧目录迁移】执行模型给出的拆分、合并或移页指令，更新文件和目录配置；不是多文件事务。
 def _apply_consolidate_changes(changes: list[dict]):
     """Execute directory-structure changes (split/merge/move)."""
     wiki_dir = config.WIKI_DIR
@@ -4670,6 +4721,7 @@ def _apply_consolidate_changes(changes: list[dict]):
     _update_wiki_references(changes)
 
 
+# 【旧链接迁移】页面移动后扫描全库，把旧目录路径链接改为新路径。
 def _update_wiki_references(changes: list[dict]):
     """Rewrite ``[[old_dir/page]]`` references across the wiki to ``[[new_dir/page]]``.
 
@@ -4723,6 +4775,7 @@ def _update_wiki_references(changes: list[dict]):
         print(f"  🔗 Updated references in {updated_files} files ({len(ref_map)} page refs remapped)")
 
 
+# 【旧定期维护／LLM】按计数阈值触发结构／内容修复、归类、合并及索引更新；当前 ingest_batch 不调用。
 def periodic_maintenance(articles_since_last: int, total_ingested: int = 0) -> bool:
     """Periodic LLM maintenance (triggered every N articles).
 
@@ -4797,6 +4850,7 @@ def periodic_maintenance(articles_since_last: int, total_ingested: int = 0) -> b
     return True
 
 
+# 【旧收尾／LLM】执行多轮 lint、代码修复和模型修复，再重建索引及概览；不属于当前默认构建的完成条件。
 def finalize_wiki():
     """Post-ingestion finalization.
 
@@ -4910,6 +4964,7 @@ def finalize_wiki():
 
 
 
+# 【旧输出解析】将模型文本里的 FILE 分隔块解析成路径到正文映射，并排除后面的 DIR_CHANGES；相同路径后块覆盖前块。
 def parse_file_outputs(text: str) -> dict[str, str]:
     """Parse ``---FILE: path---`` blocks (logic reused from the ingest engine)."""
     dir_changes_idx = text.find("---DIR_CHANGES---")
@@ -4933,6 +4988,7 @@ def parse_file_outputs(text: str) -> dict[str, str]:
     return files
 
 
+# 【旧输出解析】读取 DIR_CHANGES 后的 JSON，失败再试方括号片段；无法解析返回空列表。
 def parse_dir_changes(text: str) -> list[dict]:
     """Parse ``---DIR_CHANGES---`` blocks."""
     idx = text.find("---DIR_CHANGES---")
@@ -4952,6 +5008,7 @@ def parse_dir_changes(text: str) -> list[dict]:
 
 
 
+# 【旧整页写盘】规范模型文件路径、元数据和链接，尝试保护未展示旧页并处理同名页，最终写页面及索引；不使用当前 revision＋引用＋事实增量合同。
 def write_wiki_files(file_outputs: dict[str, str], selected_pages: list[str] = None,
                      batch_digest_stems: list[str] | None = None):
     """Write LLM-generated files into the wiki directory.
@@ -4997,6 +5054,7 @@ def write_wiki_files(file_outputs: dict[str, str], selected_pages: list[str] = N
             _confusable_map[base + "s"] = base
             _confusable_map[base + "es"] = base
 
+    # 【旧局部辅助】判断是否以 wiki/sources/ 开头，以决定来源目录例外处理。
     def _is_sources_path(path: str) -> bool:
         return path.startswith("wiki/sources/")
 
@@ -5049,7 +5107,9 @@ def write_wiki_files(file_outputs: dict[str, str], selected_pages: list[str] = N
         file_outputs = synced_outputs
         print(f"  🔗 Synced {len(_filename_norm_map)} wikilinks after filename normalization")
 
+    # 【旧局部辅助】用正则逐个规范 wikilink 目标中的文件名，返回修改后的正文。
     def _normalize_wikilink_targets(content: str) -> str:
+        # 【旧局部辅助】保留目录前缀、清洗单个链接末段名称并重新包成 wikilink。
         def _norm_link(m):
             link = m.group(1)
             if "/" in link:
@@ -5271,6 +5331,7 @@ def write_wiki_files(file_outputs: dict[str, str], selected_pages: list[str] = N
     return written
 
 
+# 【旧索引写盘】把确实位于该目录的新页追加到 Unsorted 章节，并维护目录索引。
 def _append_to_index(dir_name: str, page_name: str, content: str):
     """Append a new page to the "Unsorted" section of _index.md.
 
@@ -5332,6 +5393,7 @@ def _append_to_index(dir_name: str, page_name: str, content: str):
 
 # ─── Dedup cache ───
 
+# 【旧缓存读取】读取 SHA 缓存 JSON，缺失或损坏返回空字典；当前构建采用版本 receipt，不依赖此缓存。
 def load_cache() -> dict:
     cache_file = config.CACHE_FILE
     if cache_file and cache_file.exists():
@@ -5342,6 +5404,7 @@ def load_cache() -> dict:
     return {}
 
 
+# 【旧缓存写盘】把整份 SHA 缓存写回配置路径；不核验缓存对应产物。
 def save_cache(cache: dict):
     cache_file = config.CACHE_FILE
     if cache_file:
@@ -5349,6 +5412,7 @@ def save_cache(cache: dict):
 
 
 
+# 【旧单篇／LLM】SHA 跳过后先模型选页、再整页生成，解析写盘并存缓存；保留供历史对照，当前 ingest_single 已转向 BuildAgent。
 def _legacy_ingest_single(article_path: Path, cache: dict, force: bool = False) -> bool:
     """Ingest a single article."""
     try:
@@ -5458,6 +5522,7 @@ def _legacy_ingest_single(article_path: Path, cache: dict, force: bool = False) 
     return True
 
 
+# 【旧页面读取】读第一步选中页并拼到提示词，超总字符限额时只保留名称；不是当前工具的可续读窗口。
 def _read_selected_pages(selected_pages: list[str], max_total_chars: int = 100000) -> str:
     """Load the full text of selected pages, with a total-size safety valve.
 
@@ -5513,6 +5578,7 @@ def _read_selected_pages(selected_pages: list[str], max_total_chars: int = 10000
     return "\n\n".join(contents) if contents else "(no existing pages found)"
 
 
+# 【旧原文写盘】保存到 sources/articles 并返回文件 stem；与当前 SourceStore 的身份／内容双哈希快照不同。
 def _save_article_original(title: str, content: str, source_path: Path) -> str | None:
     """Save the original article into ``sources/articles/`` and return its stem."""
     wiki_dir = config.WIKI_DIR
@@ -5551,6 +5617,7 @@ source_title: "{escaped_title}"
 
 
 
+# 【旧批次／LLM】批次共享一次选页及一次整页生成，写盘和来源链接后为每篇写 SHA 缓存；force 在本函数内没有参与跳过判断，外层负责过滤。
 def _ingest_batch_one(batch_paths: list[Path], cache: dict, force: bool = False) -> dict:
     """Process a batch of articles: combine Step 1 (page selection) and Step 2 (generation).
 
@@ -5670,6 +5737,7 @@ def _ingest_batch_one(batch_paths: list[Path], cache: dict, force: bool = False)
     return {"success": len(articles), "failed": 0}
 
 
+# 【旧总编排／LLM】根据 SHA 缓存筛选文章、分批运行旧生成并处理维护及最终修复；不是当前公开 ingest_batch 的实现。
 def _legacy_ingest_batch(article_paths: list[Path], batch_size: int = 5,
                  limit: int = None, force: bool = False):
     """Ingest articles in batches (with periodic maintenance and final repair)."""
@@ -5701,6 +5769,7 @@ def _legacy_ingest_batch(article_paths: list[Path], batch_size: int = 5,
     t_total = time.time()
     processed_count = 0  # processed-article counter (used by the progress bar)
 
+    # 【旧进度辅助】把秒数格式化为时分秒或分秒文本。
     def _format_time(seconds: float) -> str:
         """Format a duration in seconds as HH:MM:SS or MM:SS."""
         seconds = int(seconds)
@@ -5716,6 +5785,7 @@ def _legacy_ingest_batch(article_paths: list[Path], batch_size: int = 5,
         else:
             return f"{seconds:d}s"
 
+    # 【旧进度辅助】按完成数、耗时估算进度和剩余时间并输出，不控制实际任务调度。
     def _print_progress_bar(current: int, total_items: int, elapsed: float,
                             bar_width: int = 30):
         """Print a progress bar with percentage, elapsed time and ETA."""
@@ -5790,6 +5860,7 @@ def _legacy_ingest_batch(article_paths: list[Path], batch_size: int = 5,
 
 
 
+# 【当前兼容入口／间接 LLM】把单篇交 ingest_documents；cache 参数忽略，以文档和摘要均无失败返回 True。
 def ingest_single(article_path: Path, cache: dict | None = None, force: bool = False) -> bool:
     """Compile one document using validated version receipts; old SHA caches are ignored."""
     from build_agent import ingest_documents
@@ -5797,6 +5868,7 @@ def ingest_single(article_path: Path, cache: dict | None = None, force: bool = F
     return result["failed"] == 0 and result.get('summaries', {}).get('failed', 0) == 0
 
 
+# 【当前构建入口／间接 LLM】直接转交 ingest_documents；batch_size 只兼容旧签名，limit 是文章数，force 控制文档重建，不运行旧整页维护。
 def ingest_batch(article_paths: list[Path], batch_size: int = 5,
                  limit: int | None = None, force: bool = False):
     """Process documents independently; batch_size retained for CLI compatibility.
@@ -5807,6 +5879,7 @@ def ingest_batch(article_paths: list[Path], batch_size: int = 5,
     return ingest_documents(article_paths, force=force, limit=limit)
 
 
+# 【当前构建 CLI】设置数据集并排序枚举 raw/articles，按 --limit 截文章后调用当前 ingest_batch；文档或摘要失败时退出码 1。
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Benchmark Wiki ingestion")

@@ -56,6 +56,7 @@ LLM_LINT_API_BASE    = _API_BASE
 LLM_HEADERS: dict = {}
 
 
+# 【兼容配置】从环境组装 Bearer 请求头；当前 llm_client 使用自己的 _headers，此接口供旧调用兼容。
 def get_llm_headers() -> dict:
     api_key = os.environ.get("OPENAI_API_KEY", "")
     return {
@@ -70,6 +71,7 @@ def get_llm_headers() -> dict:
 
 INGEST_TOOL_BUDGET        = int(os.environ.get("INGEST_TOOL_BUDGET", "40"))
 SUMMARY_BUILD_LIMIT       = int(os.environ.get("SUMMARY_BUILD_LIMIT", "20"))
+INGEST_TOKEN_BUDGET       = int(os.environ.get("INGEST_TOKEN_BUDGET", "250000"))  # per-document abort threshold
 INGEST_BATCH_SIZE         = 10
 INGEST_MAX_CONTENT_LEN    = 15000
 INGEST_MIN_CONTENT_LEN    = 50
@@ -127,6 +129,7 @@ WIKI_LOG:      Path | None = None
 INGEST_LOG_DIR: Path | None = None
 
 
+# 【共享配置】设置当前数据集和 wiki/raw/cache/log 路径并创建 wiki 根目录；这是模块全局状态，同一模块实例中后调用会覆盖前配置。
 def set_dataset(dataset_name: str) -> None:
     """Activate a dataset: compute and create all wiki / raw / cache paths."""
     global _current_dataset, WIKI_DIR, CACHE_FILE, RAW_DIR
@@ -144,24 +147,30 @@ def set_dataset(dataset_name: str) -> None:
     INGEST_LOG_DIR = WIKI_DIR.parent / "logs"
 
 
+# 【配置读取】返回当前数据集名称；尚未 set_dataset 时为 None。
 def get_dataset() -> str | None:
     return _current_dataset
 
 
 # Aliases expected by the ingestion engine.
+# 【兼容别名】把旧 user_key 当数据集名称交给 set_dataset，不实现用户隔离或鉴权。
 def set_user(user_key: str) -> None:
     set_dataset(user_key)
 
+# 【兼容别名】返回当前数据集名称，不读取用户账户。
 def get_user() -> str | None:
     return _current_dataset
 
+# 【兼容别名】返回当前数据集名称，供旧接口使用。
 def get_current_user() -> str | None:
     return _current_dataset
 
+# 【兼容空操作】benchmark 模式不启用镜像；函数体只 pass。
 def enable_wfs_mirror() -> None:
     """No-op in benchmark mode."""
     pass
 
+# 【兼容空操作】原样返回 name；名称不在这里做消歧或归一化。
 def normalize_entity_name(name: str) -> str:
     return name
 
@@ -172,6 +181,7 @@ def normalize_entity_name(name: str) -> str:
 _FM_SPLIT_RE = re.compile(r'^---\s*$', re.MULTILINE)
 
 
+# 【旧文本拆分】用独占行的 --- 切开元数据与正文，返回三元组或 None；不执行 YAML 类型校验，当前存储使用 wiki_store.frontmatter。
 def split_frontmatter(text: str) -> tuple[str, str, str] | None:
     """Split YAML frontmatter and body.
 
@@ -191,6 +201,7 @@ def split_frontmatter(text: str) -> tuple[str, str, str] | None:
 # Page-type management
 # ---------------------------------------------------------------------------
 
+# 【目录配置读取】优先 wiki 内 page_types.yaml，其次 configs 模板，再次内置默认；空字典也有效，不强制默认分类。
 def get_page_types() -> dict:
     """Return page types: prefer wiki-local YAML, then configs template, then defaults."""
     if WIKI_DIR is not None:
@@ -213,6 +224,7 @@ def get_page_types() -> dict:
     return dict(DEFAULT_PAGE_TYPES)
 
 
+# 【目录配置写入】把给定字典存到 wiki/page_types.yaml；未配置 wiki 时直接返回。
 def save_page_types(page_types: dict) -> None:
     if WIKI_DIR is None:
         return
@@ -224,6 +236,7 @@ def save_page_types(page_types: dict) -> None:
     (WIKI_DIR / "page_types.yaml").write_text(content, encoding="utf-8")
 
 
+# 【旧目录注册】类型尚不存在时保存描述、建目录并打印；当前事实写入可直接按内容路径建目录，不依赖此注册。
 def register_page_type(name: str, description: str, auto_created: bool = True) -> None:
     page_types = get_page_types()
     if name not in page_types:
@@ -234,6 +247,7 @@ def register_page_type(name: str, description: str, auto_created: bool = True) -
         print(f"  Registered new page type: {name} — {description}")
 
 
+# 【旧目录配置】对 split/move_page 建立目标目录和类型条目；本函数本身不搬页面，实际迁移在旧 ingest 辅助函数中。
 def apply_dir_changes(changes: list[dict]) -> None:
     page_types = get_page_types()
     for change in changes:
@@ -248,6 +262,7 @@ def apply_dir_changes(changes: list[dict]) -> None:
             print(f"  Created directory: {to_dir}")
 
 
+# 【旧目录映射】合并已注册知识类型与固定来源目录，返回名称到 Path；不是实时全文件系统树。
 def get_page_dirs() -> dict[str, Path]:
     if WIKI_DIR is None:
         return {}
@@ -259,6 +274,7 @@ def get_page_dirs() -> dict[str, Path]:
     return dirs
 
 
+# 【旧目录描述】汇总注册类型与固定来源目录的描述和路径，供旧提示词／索引使用。
 def get_all_dir_info() -> dict[str, dict]:
     result: dict[str, dict] = {}
     for name, info in get_page_types().items():
@@ -270,6 +286,7 @@ def get_all_dir_info() -> dict[str, dict]:
     return result
 
 
+# 【旧提示词材料】把配置目录、页面数量和描述拼成 Markdown 清单；不同于当前检索器的实时 tree。
 def get_dir_catalog_text() -> str:
     lines = []
     for name, info in get_all_dir_info().items():
@@ -294,6 +311,7 @@ def get_dir_catalog_text() -> str:
     return "\n".join(lines)
 
 
+# 【当前初始化】创建固定来源目录与 versions，并在缺失时写空类型注册表；不抽样、不调用 LLM 生成 purpose 或分类。
 def ensure_wiki_dirs() -> None:
     """Create wiki directories; auto-init page types on first run."""
     if WIKI_DIR is None:
@@ -311,6 +329,7 @@ def ensure_wiki_dirs() -> None:
 # Purpose file management
 # ---------------------------------------------------------------------------
 
+# 【当前构建目标】优先根目录 purpose_<dataset>.md，否则返回 configs/purpose_bench.md；只选择路径，不生成内容。
 def get_purpose_file() -> Path:
     """Return the dataset-specific purpose file, falling back to a template."""
     if _current_dataset:
@@ -323,6 +342,7 @@ def get_purpose_file() -> Path:
 # LLM-based first-run auto-initialisation
 # ---------------------------------------------------------------------------
 
+# 【旧初始化辅助】读取至多 max_len 字符，缺失或读失败返回提示字符串。
 def _read_file_safe(path: Path | None, max_len: int = 5000) -> str:
     if path is not None and path.exists():
         try:
@@ -333,6 +353,7 @@ def _read_file_safe(path: Path | None, max_len: int = 5000) -> str:
     return "(empty)"
 
 
+# 【旧初始化辅助】从排序文章中均匀选样，抽取标题和前 1200 字符；当前 ensure_wiki_dirs 不调用它。
 def _sample_articles_for_init(n: int = 200) -> list[dict]:
     """Uniformly sample up to n articles from RAW_DIR."""
     if RAW_DIR is None or not RAW_DIR.exists():
@@ -368,6 +389,7 @@ def _sample_articles_for_init(n: int = 200) -> list[dict]:
     return samples
 
 
+# 【旧显式初始化／LLM】已有 purpose 就复用，否则取文章样本让模型生成目标文件，样本不足或失败用模板；当前默认构建不自动执行。
 def auto_init_purpose() -> Path | None:
     """Ask the LLM to summarise the corpus and write a purpose_<dataset>.md."""
     from llm_client import call_llm
@@ -424,6 +446,7 @@ def auto_init_purpose() -> Path | None:
     return purpose_path
 
 
+# 【兼容初始化】仅在 wiki 类型配置缺失时写空字典；不调用模型，也不分析文章主题。
 def auto_init_page_types() -> None:
     """Compatibility entry point: initialize an empty, content-driven registry."""
     if WIKI_DIR is not None and not (WIKI_DIR / "page_types.yaml").exists():

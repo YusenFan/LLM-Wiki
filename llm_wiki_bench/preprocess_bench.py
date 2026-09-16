@@ -33,6 +33,7 @@ RAW_DIR = BASE_DIR / "raw"
 DATA_DIR = BASE_DIR / "data"
 
 
+# 【文件名清洗】将非法文件名字符替换为下划线并规范空白、截长；碰撞由 _write_articles 的哈希后缀处理。
 def sanitize_filename(name: str) -> str:
     """Strip characters that are illegal in file names."""
     # Strip filesystem-illegal characters.
@@ -45,6 +46,8 @@ def sanitize_filename(name: str) -> str:
     return name[:200] if name else "untitled"
 
 
+# 【文章落盘】将去重后的标题／正文变体写成 Markdown，保留明确 source_identity；文件名加哈希避免清洗后的同名碰撞。
+# 原文版本稍后由 SourceStore 对完整输入计算。
 def _write_articles(paragraphs: dict, output_dir: Path, dataset: str) -> int:
     """Preserve all title/text variants; source identity is separate from version.
 
@@ -65,6 +68,7 @@ def _write_articles(paragraphs: dict, output_dir: Path, dataset: str) -> int:
     return len(paragraphs)
 
 
+# 【数据转换】读取 HotpotQA JSON，按 limit 选题，收集 context 中全部不同标题／正文组合（含干扰段落），写文章和统一 qa_pairs.jsonl，返回数量统计。
 def process_hotpotqa(input_path: Path, output_dir: Path, data_dir: Path,
                      limit: int = None) -> dict:
     """Process the HotpotQA distractor dev set.
@@ -126,6 +130,7 @@ def process_hotpotqa(input_path: Path, output_dir: Path, data_dir: Path,
     }
 
 
+# 【数据转换】读取 MuSiQue JSONL，整理问题、别名及支撑标题并收集不同段落，输出统一文章与 QA 文件；不调用模型。
 def process_musique(input_path: Path, output_dir: Path, data_dir: Path,
                     limit: int = None) -> dict:
     """Process the MuSiQue-Ans dev set.
@@ -202,6 +207,7 @@ def process_musique(input_path: Path, output_dir: Path, data_dir: Path,
     }
 
 
+# 【数据转换】读取 2Wiki JSON，提取题目、支撑标题与上下文文章，保留标题／正文变体并写统一文件；不调用模型。
 def process_2wikimhqa(input_path: Path, output_dir: Path, data_dir: Path,
                       limit: int = None) -> dict:
     """Process the 2WikiMultiHopQA dev set.
@@ -275,6 +281,7 @@ DATASET_PROCESSORS = {
 }
 
 
+# 【预处理 CLI】解析数据集和题数限制，调对应处理器生成 raw/articles 与 data/qa_pairs；已有同名输出可能被改写。
 def main():
     parser = argparse.ArgumentParser(
         description="Pre-process multi-hop QA datasets into Markdown articles."

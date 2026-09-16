@@ -39,6 +39,7 @@ If the selected facts cannot support a useful cross-document summary, call skip_
 """
 
 
+# 【摘要候选输入】扫描知识页，挑出含当前 fact/relation 且引文可校验的页面；返回页面资料及问题清单，旧自由正文不能自动充当叶事实。
 def eligible_pages(retriever: WikiRetriever) -> tuple[dict, list[dict]]:
     pages, issues = {}, []
     retriever.load()
@@ -61,6 +62,8 @@ def eligible_pages(retriever: WikiRetriever) -> tuple[dict, list[dict]]:
     return pages, issues
 
 
+# 【确定性组队】先保留可重建的已有摘要组，再按显式链接优先、BM25 分数次之，为每个种子取最多三个候选并去重。
+# 新组是页面对；相关性最终交给模型，词重叠不证明关系。
 def candidate_pairs(retriever: WikiRetriever, pages: dict, seeds=None) -> list[list[str]]:
     """Explicit links and lexical candidates only propose groups; the LLM may reject them."""
     pairs, seen = [], set()
@@ -92,6 +95,8 @@ def candidate_pairs(retriever: WikiRetriever, pages: dict, seeds=None) -> list[l
     return pairs
 
 
+# 【输入预算】按现有事实顺序每页选最多八条，均分字符预算且不截断事实/引文；超大事实跳过，无可选事实则失败。
+# 返回材料包和临时 evidence_id／fact_id 到支撑位置的映射，不是 LLM 选事实。
 def evidence_packet(paths: list[str], pages: dict, max_chars=32000) -> tuple[list[dict], dict]:
     """Bound input without truncating a fact or its quotations. Disclose selective coverage."""
     packet, refs = [], {}
@@ -104,6 +109,7 @@ def evidence_packet(paths: list[str], pages: dict, max_chars=32000) -> tuple[lis
             if size + length > per_page or len(selected) >= 8:
                 continue
             refs[item['evidence_id']] = {'path': path, 'fact_id': fact['id']}
+            refs[fact['id']] = refs[item['evidence_id']]  # models often cite the fact id instead of F<n>
             selected.append(item)
             size += length
         if not selected:
@@ -113,6 +119,9 @@ def evidence_packet(paths: list[str], pages: dict, max_chars=32000) -> tuple[lis
     return packet, refs
 
 
+# 【摘要编译／LLM】检查资格、候选和缓存，每组一次模型调用，只接受一个 write_summary 或 skip_summary；把模型支撑 ID 转成真实事实引用后交 SummaryStore.apply。
+# 无变化的 skipped/部分 failed 决策会复用；模型无响应不写失败缓存。
+# dry_run 不调用模型、不写内部文件；force 才绕过缓存。
 def build_summaries(wiki_dir: Path, *, call=None, model=None, limit=20, seeds=None,
                     force=False, dry_run=False) -> dict:
     if not isinstance(limit, int) or limit < 0:
@@ -137,7 +146,7 @@ def build_summaries(wiki_dir: Path, *, call=None, model=None, limit=20, seeds=No
         if decision_path.exists() and not force:
             try:
                 decision = json.loads(decision_path.read_text())
-                if decision.get('signature') == signature and decision.get('status') == 'skipped':
+                if decision.get('signature') == signature and decision.get('status') in ('skipped', 'failed'):
                     report['cached'] += 1
                     continue
             except (ValueError, OSError):
@@ -192,6 +201,9 @@ def build_summaries(wiki_dir: Path, *, call=None, model=None, limit=20, seeds=No
                 continue
             if function['name'] != 'write_summary':
                 raise ValueError('unexpected summary tool')
+            unknown = [fid for c in args['claims'] for fid in c['supports'] if fid not in refs]
+            if unknown:
+                raise ValueError(f'claim supports unknown fact ids {unknown[:3]}; only fact ids from the evidence packet may be cited')
             claims = [{'statement': c['statement'], 'kind': c['kind'],
                        'supports': [refs[fid] for fid in c['supports']]} for c in args['claims']]
             saved = store.apply(children=[{'path': p, 'revision': pages[p]['revision']} for p in paths],
@@ -202,10 +214,14 @@ def build_summaries(wiki_dir: Path, *, call=None, model=None, limit=20, seeds=No
         except (ValueError, KeyError, TypeError, OSError, RuntimeError) as exc:
             report['failed'] += 1
             report['items'].append({'path': path, 'status': 'failed', 'error': str(exc)})
+            if 'model call failed' not in str(exc):
+                # Deterministic (temperature 0) failure: do not retry until the inputs change.
+                atomic_write(decision_path, json.dumps({'signature': signature, 'status': 'failed', 'error': str(exc)}))
     report['elapsed_seconds'] = time.monotonic() - started
     return report
 
 
+# 【摘要 CLI】解析 wiki-dir、limit、model、force、dry-run，打印统计并可写 output；即使 dry-run，显式指定 output 仍会写报告，failed 非零时退出码为 1。
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--wiki-dir', type=Path, required=True)

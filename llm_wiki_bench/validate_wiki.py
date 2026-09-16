@@ -16,6 +16,7 @@ except ImportError:
 import yaml
 
 
+# 【有限修复】给部分可确定的 YAML 列表或标量补 JSON 引号；只改可识别格式，不推测缺失事实。
 def repair_metadata(text: str) -> str:
     """Quote unquoted punctuation in known scalar/list metadata, never infer values."""
     match = re.match(r'\A---[ \t]*\n(.*?)\n---[ \t]*(?:\n|$)', text, re.S)
@@ -37,6 +38,8 @@ def repair_metadata(text: str) -> str:
     return text[:match.start(1)] + '\n'.join(lines) + text[match.end(1):]
 
 
+# 【审计／可选修复】扫描可见 Markdown，检查原文完整性、摘要失效、事实引用和链接；repair=True 时备份后修围栏／可确定元数据／唯一裸链接并归档旧原文。
+# 不会用 LLM，也不重写受控摘要或原文版本；返回问题和数量，不保证语义正确。
 def audit(wiki_dir: Path, repair=False) -> dict:
     wiki_dir = Path(wiki_dir).resolve()
     sources = SourceStore(wiki_dir)
@@ -83,6 +86,7 @@ def audit(wiki_dir: Path, repair=False) -> dict:
             except (ValueError, yaml.YAMLError):
                 meta = {}
             report['issues'].append({'path': relative, 'kind': 'frontmatter', 'detail': str(exc), 'repaired': repaired})
+        # 【局部链接处理】检查 wikilink 目标并记录问题；仅 repair 模式且裸名称恰有一个候选时替换路径，保留标签和锚点。
         def resolve(match):
             link = match.group(1)
             target, sep, label = link.partition('|')
@@ -142,6 +146,7 @@ def audit(wiki_dir: Path, repair=False) -> dict:
     return report
 
 
+# 【审计 CLI】读取 wiki-dir 和 repair 选项，执行 audit 并写 output；有未解决问题不自动转成非零退出码，需查看报告。
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--wiki-dir', type=Path, required=True)

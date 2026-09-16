@@ -1,0 +1,14 @@
+node_modules/
+.venv/
+venv/
+.pytest_cache/
+__pycache__/
+.wiki-cache-*.json
+wiki_output/
+raw/
+data/
+datasets/
+results/
+logs/
+*.log
+.env

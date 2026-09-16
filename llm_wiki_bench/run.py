@@ -32,6 +32,7 @@ if str(_BENCH_DIR) not in sys.path:
     sys.path.append(str(_BENCH_DIR))
 
 
+# 【下载编排】查数据集下载器并执行，打印阶段信息；以返回路径是否存在值判断成功，不调用模型。
 def step_download(dataset: str) -> bool:
     """Download the public dev set."""
     from download_datasets import DATASET_DOWNLOADERS, DATASETS_DIR
@@ -49,6 +50,7 @@ def step_download(dataset: str) -> bool:
     return downloader(ds_dir) is not None
 
 
+# 【预处理编排】检查下载文件并选择数据集处理器，传 limit 限制 QA 样本数；写文章和 qa_pairs，返回是否成功。
 def step_preprocess(dataset: str, limit: int | None = None) -> bool:
     """Pre-process context paragraphs into Markdown articles."""
     from preprocess_bench import DATASET_PROCESSORS, DATASETS_DIR, RAW_DIR, DATA_DIR
@@ -77,6 +79,8 @@ def step_preprocess(dataset: str, limit: int | None = None) -> bool:
     return True
 
 
+# 【构建编排／间接 LLM】配置数据集、创建目录，排序读取全部已有文章后调用当前 ingest_batch；文档或摘要失败均返回 False。
+# 这里不接收 run 的 limit。
 def step_ingest(dataset: str, batch_size: int = 3, force: bool = False) -> bool:
     """Build the wiki by ingesting all preprocessed articles."""
     import bench_config as config
@@ -106,6 +110,7 @@ def step_ingest(dataset: str, batch_size: int = 3, force: bool = False) -> bool:
     return result["failed"] == 0 and result.get('summaries', {}).get('failed', 0) == 0
 
 
+# 【阶段控制】按 only/skip 参数依次运行下载、预处理和构建，前序失败阻止后续；打印耗时并返回总状态。
 def run_one(dataset: str, args) -> bool:
     t0 = time.time()
     ok = True
@@ -124,6 +129,7 @@ def run_one(dataset: str, args) -> bool:
     return ok
 
 
+# 【离线 CLI】解析数据集和阶段选项，互斥校验 only 参数后逐数据集运行；--limit 限制预处理题数，不限制已有文章的 only-ingest。
 def main():
     parser = argparse.ArgumentParser(
         description="LLM-Wiki benchmark runner (offline wiki construction)."

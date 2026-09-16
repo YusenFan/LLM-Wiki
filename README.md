@@ -16,6 +16,13 @@ online retrieval / question answering / evaluation.
 
 ---
 
+## 中文学习入口
+
+先读 [从原文到 Wiki，再到答案：系统学习指南](docs/system-learning-guide.md)，
+按构建、摘要、检索和 QA 的实际调用链理解系统，再查
+[213 个函数／方法的逐项索引](docs/function-reference.md)。
+源码已补充中文函数注释，区分当前工具流程、确定性校验和保留的旧整页生成流程。
+
 ## Repository layout
 
 ```

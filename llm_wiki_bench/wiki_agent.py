@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -15,6 +16,8 @@ except ImportError:
     from build_agent import covered
     from wiki_retriever import WIKI_TOOL_SCHEMAS, WikiPage, WikiRetriever, CITATION, S, I, STRINGS, tool_schema
 
+STALL_REPEATS = 4  # stop when the model repeats the same tool call this many times in a row
+MAX_FINAL_REJECTIONS = 8  # stop after this many rejected finish_answer attempts
 SUMMARY_REF = {'type': 'object', 'properties': {'path': S, 'revision': S, 'claim_ids': STRINGS},
                'required': ['path', 'revision', 'claim_ids'], 'additionalProperties': False}
 FINISH = tool_schema('finish_answer', 'Finish with a short answer, original citations, reasoning and explicit gaps. If using derived summary claims, include their summary_refs AND the original evidence for every selected claim.', {
@@ -44,8 +47,11 @@ source_read includes paragraph ranges; prefer these when quoting whole paragraph
 For legacy source pages without IDs, wiki_read returns source_ref; use source_read to verify that immutable snapshot.
 Do not use parametric knowledge to fill missing facts. Absence of evidence does not establish falsity.
 Track gaps and new evidence with evidence_note. Avoid duplicate searches/reads; next_start retrieves unread text.
-Use finish_answer for the final result. Put the shortest answer in answer, explanation/inference in reasoning,
-and citations and unresolved matters in their own fields. If evidence is insufficient, answer unknown and report gaps.
+Use finish_answer for the final result. answer MUST be the minimal answer span only, never a sentence:
+an entity name ("YG Entertainment"), a number ("3,677"), a date, a title, or exactly "yes"/"no" for comparison
+questions ("Were X and Y both American?" -> "yes"). Put explanation/inference in reasoning,
+and citations and unresolved matters in their own fields. Each citation needs the 64-hex source_id/version_id
+from source_read plus a quote copied verbatim from that source_read text; page paths/revisions are not citations. If evidence is insufficient, answer unknown and report gaps.
 Status not_found means only not found in the searched scope; conflict means unresolved contrary evidence.
 """
 NOTE = tool_schema('evidence_note', 'Record current gaps and what new evidence resolved; then continue exploring if needed.',
@@ -76,6 +82,7 @@ class RetrievalResult:
 
 
 class WikiAgent:
+    # 【QA 初始化】注入检索器、模型和预算；默认单 Agent，select_pages 限定候选数，patience 仅兼容保留；allow_subtasks 仅显式 Python 调用可启用。
     def __init__(self, retriever: WikiRetriever, *, call_llm_with_tools: Callable,
                  model=None, answer_model=None, subtask_model=None, t_max=30, patience=3,
                  select_pages=5, verbose=False, allow_subtasks=False, scope=None):
@@ -87,9 +94,13 @@ class WikiAgent:
         self.t_max, self.patience, self.select_pages = t_max, patience, select_pages
         self.verbose, self.allow_subtasks, self.scope = verbose, allow_subtasks, scope
 
+    # 【范围检查】未指定 scope 则放行，否则只允许等于范围路径或在其子目录内的路径。
     def _allowed_path(self, path):
         return not self.scope or any(path == d or path.startswith(d.rstrip('/') + '/') for d in self.scope)
 
+    # 【问答主循环／LLM】以问题和实时树开始，模型选择检索／读取／记缺口，代码执行并累计工具结果。
+    # 普通文本不算最终答案，必须通过 _finish；探索预算用尽最多再给两次只提交答案的模型机会。
+    # 记录工具轨迹、来源读取区间和模型用量，未完成返回 unknown 及缺口。
     def retrieve(self, question: str) -> RetrievalResult:
         started = time.monotonic()
         result = RetrievalResult()
@@ -100,10 +111,12 @@ class WikiAgent:
         messages = [{'role': 'system', 'content': SYSTEM}, {'role': 'user', 'content': json.dumps(
             {'question': question, 'tree': tree, 'scope': self.scope, 'tool_budget': self.t_max}, ensure_ascii=False)}]
         seen = set()
+        recent: list = []
         source_permissions = set()
         tools = WIKI_TOOL_SCHEMAS + [NOTE, FINISH] + ([VERIFY] if self.allow_subtasks else [])
         done = False
         final_attempts = 0
+        final_rejections = 0
         for _ in range(self.t_max + 4):
             final_only = result.total_calls >= self.t_max
             if final_only:
@@ -126,6 +139,12 @@ class WikiAgent:
             if not calls:
                 messages.append({'role': 'user', 'content': 'Continue evidence gathering or submit finish_answer with citations and gaps; plain text is not a validated answer.'})
                 continue
+            if len(recent) >= STALL_REPEATS and len(set(recent[-STALL_REPEATS:])) == 1:
+                result.evidence_gaps.append(f'Stopped: the same failing tool call was repeated {STALL_REPEATS} times.')
+                break
+            if final_rejections >= MAX_FINAL_REJECTIONS:
+                result.evidence_gaps.append(f'Stopped: finish_answer was rejected {final_rejections} times.')
+                break
             for tc in calls:
                 name = tc.get('function', {}).get('name', '')
                 args = {}
@@ -133,10 +152,15 @@ class WikiAgent:
                     args = json.loads(tc['function'].get('arguments', '{}'))
                     if not isinstance(args, dict):
                         raise ValueError('arguments must be an object')
+                    recent.append((name, json.dumps(args, sort_keys=True)))
                     if done:
                         raise ValueError('answer already finalized')
                     if name == 'finish_answer':
-                        self._finish(args, result)
+                        try:
+                            self._finish(args, result)
+                        except (ValueError, TypeError, KeyError, OSError):
+                            final_rejections += 1
+                            raise
                         payload, done = {'accepted': True}, True
                     else:
                         if result.total_calls >= self.t_max:
@@ -201,6 +225,7 @@ class WikiAgent:
         result.elapsed_seconds = time.monotonic() - started
         return result
 
+    # 【工具参数约束】限制搜索候选数并执行可选子任务目录／来源权限；scope 为空的默认主 Agent 不要求先读页才能 source_read。
     def _scope_arguments(self, name, args, source_permissions):
         args = dict(args)
         if name in ('wiki_search', 'entity_lookup'):
@@ -218,6 +243,7 @@ class WikiAgent:
             raise ValueError('read a scoped page referencing this source first')
         return args
 
+    # 【观测记账】把搜索结果、已读页、source_read 区间及摘要 evidence 展开记录到 RetrievalResult；只有 source_read 建立原文已读覆盖，读摘要不替代读原文。
     def _observe(self, name, payload, result, permissions):
         if isinstance(payload, dict) and 'error' in payload:
             return
@@ -260,6 +286,8 @@ class WikiAgent:
                         permissions.add((citation['source_id'], citation['version_id']))
             result.evidence_updates.append({'summary_path': path, 'revision': revision, 'view': payload['view']})
 
+    # 【答案验收】校验字段、状态和原文引文并要求引文区间已读；若显式提交 summary_refs，还检查摘要版本、展开记录及全部支撑引文覆盖。
+    # 清理 Yes/No 句首格式后写结果；不自动判定推理正确、不证明每一跳齐全，也不能检测模型漏报使用的摘要。
     def _finish(self, args, result):
         for key in ('answer', 'reasoning', 'status'):
             if not isinstance(args.get(key), str):
@@ -269,11 +297,20 @@ class WikiAgent:
         if not isinstance(args.get('evidence_gaps'), list) or not isinstance(args.get('citations'), list):
             raise ValueError('citations and evidence_gaps lists required')
         citations = []
-        for citation in args['citations']:
-            clean = self.retriever.sources.validate_citation(citation)
+        for index, citation in enumerate(args['citations']):
+            try:
+                clean = self.retriever.sources.validate_citation(citation)
+            except (ValueError, KeyError, TypeError) as exc:
+                raise ValueError(f'citation {index} ({str(citation.get("quote", ""))[:50]!r}): {exc}') from exc
             if not covered(result.source_ranges.get((clean['source_id'], clean['version_id']), []), clean['start'], clean['end']):
-                raise ValueError('final citation must have been read using source_read')
+                raise ValueError(f'citation {index}: final citation must have been read using source_read (call source_read on this source_id/version_id covering [{clean["start"]},{clean["end"]}) first)')
             citations.append(clean)
+        answer = args['answer'].strip()
+        # Comparison questions are graded on a bare yes/no; strip a leading "Yes, ..." sentence.
+        m = re.match(r'^(yes|no)\s*[,.!:;-]\s+\S', answer, re.I)
+        if m:
+            answer = m.group(1).lower()
+        args = {**args, 'answer': answer}
         if args['answer'].strip().casefold() != 'unknown' and (not citations or args['status'] != 'found'):
             raise ValueError('unsupported or unresolved answer must be unknown; supported answer requires original citations and found status')
         if args['status'] != 'found' and not args['evidence_gaps']:

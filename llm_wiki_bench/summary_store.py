@@ -18,6 +18,7 @@ END = '<!-- wiki-summary:end -->'
 BLOCK = re.compile(re.escape(START) + r'\n```json\n(.*?)\n```\n' + re.escape(END), re.S)
 
 
+# 【摘要解析】提取唯一 wiki-summary JSON 块，验证 level=1、schema_version、子页、陈述和来源集合基本形状；不验证陈述语义。
 def summary_state(text: str) -> dict:
     matches = BLOCK.findall(text)
     if len(matches) != 1:
@@ -25,6 +26,7 @@ def summary_state(text: str) -> dict:
     state = json.loads(matches[0])
     if not isinstance(state, dict) or state.get('schema_version') != 1 or state.get('level') != 1:
         raise ValueError('only level-one summaries are supported')
+    # 【局部校验】把摘要字段检查的布尔结果统一转换为 ValueError，供 summary_state 拒绝坏记录。
     def require(condition):
         if not condition:
             raise ValueError('malformed summary record')
@@ -49,6 +51,7 @@ def summary_state(text: str) -> dict:
     return state
 
 
+# 【叶事实筛选】保留 fact/relation，去掉被任何 supersedes 指向的事实及 kind=summary；显式冲突双方继续保留。
 def current_facts(text: str) -> list[dict]:
     """Retain explicit conflicts, exclude superseded facts and generated summaries."""
     facts = fact_state(text)['facts']
@@ -56,20 +59,24 @@ def current_facts(text: str) -> list[dict]:
     return [f for f in facts if f['kind'] in ('fact', 'relation') and f['id'] not in superseded]
 
 
+# 【展示】把摘要 claims 拼成概览文字；为 synthesis 加前缀，提醒这是综合推导。
 def summary_text(state: dict) -> str:
     return '\n'.join(('Synthesis: ' if c['kind'] == 'synthesis' else '') + c['statement']
                      for c in state['claims'])
 
 
 class SummaryStore:
+    # 【初始化】绑定 wiki 根目录和原文库；不创建摘要，也不调用模型。
     def __init__(self, wiki_dir: Path):
         self.root = Path(wiki_dir)
         self.sources = SourceStore(self.root)
 
+    # 【摘要身份】对子页路径排序后哈希得到 summaries/*.md；相同子页组重建复用路径，内容版本另由 revision 表示。
     @staticmethod
     def path_for(children: list[str]) -> str:
         return 'summaries/' + digest(json.dumps(sorted(children))) + '.md'
 
+    # 【叶节点读取】只接受知识 Markdown 页，排除来源副本及递归摘要；返回页 revision 和当前事实 ID 映射。
     def leaf(self, path: str) -> tuple[str, dict[str, dict]]:
         if path.startswith(('summaries/', 'sources/')):
             raise ValueError('summary children must be knowledge pages, never summaries or source copies')
@@ -81,11 +88,14 @@ class SummaryStore:
             raise ValueError('recursive summaries are not supported')
         return digest(text), {f['id']: f for f in current_facts(text)}
 
+    # 【依赖快照】列出指定 source_id 已归档的全部 version_id；这是版本集合，不负责判断哪一版本最新。
     def versions(self, source_ids) -> dict[str, list[str]]:
         directory = self.root / 'sources' / 'versions'
         return {sid: sorted(p.stem.split('--', 1)[1] for p in directory.glob(sid + '--*.md'))
                 for sid in sorted(source_ids)}
 
+    # 【摘要提交】校验 2..4 个不同子页、版本、1..8 条 claims 和支撑事实；由代码从事实推导引文，要求整体使用每个子页及至少两个来源身份。
+    # 加锁复核依赖，保留旧摘要历史，再原子写入；不验证 direct/synthesis 的语义分类是否正确。
     def apply(self, *, children: list[dict], title: str, claims: list[dict],
               expected_revision: str | None = None, source_versions: dict | None = None) -> dict:
         if not isinstance(children, list) or not 2 <= len(children) <= 4:
@@ -157,6 +167,7 @@ class SummaryStore:
             atomic_write(target, text)
         return {'path': path, 'revision': digest(text), 'claim_ids': [c['id'] for c in validated]}
 
+    # 【摘要读取】按路径解析摘要并检查子页集合与摘要路径哈希一致，返回 (state, revision)；新鲜度由 freshness 另查。
     def get(self, path: str) -> tuple[dict, str]:
         if not path.startswith('summaries/'):
             raise ValueError('expected a summary path')
@@ -166,6 +177,7 @@ class SummaryStore:
             raise ValueError('summary identity does not match its children')
         return state, digest(text)
 
+    # 【失效判定】比较子页 revision、来源版本集合并校验引文，返回过期原因列表；空列表仅代表依赖未变，不代表知识最新或语义正确。
     def freshness(self, state: dict) -> list[str]:
         reasons = []
         try:
@@ -182,10 +194,17 @@ class SummaryStore:
             reasons.append('dependency unavailable or invalid: ' + str(exc))
         return reasons
 
+    # 【渐进披露】overview 返回概览，claims 返回陈述及支撑映射，evidence 一次展开一个 claim 的事实和引文。
+    # 过期摘要仅返回状态及子页导航；这些读取不计为 QA 已读原文。
     def read(self, path: str, view: str = 'overview', claim_ids: list[str] | None = None) -> dict:
         if view not in ('overview', 'claims', 'evidence'):
             raise ValueError('summary view must be overview, claims or evidence')
-        state, revision = self.get(path)
+        if isinstance(path, str) and not path.endswith('.md'):
+            path = path + '.md'
+        try:
+            state, revision = self.get(path)
+        except FileNotFoundError:
+            raise ValueError(f'unknown summary path {path!r}; use a path returned by wiki_search layer=summaries or wiki_read') from None
         reasons = self.freshness(state)
         result = dict(path=path, revision=revision, level=1, title=state['title'], view=view,
                       status='stale' if reasons else 'current', stale_reasons=reasons,

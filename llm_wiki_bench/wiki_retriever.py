@@ -39,6 +39,7 @@ class SearchResult:
 
 
 class WikiRetriever:
+    # 【检索初始化】绑定 wiki、BM25 模式及可选 reranker 回调，创建内存索引容器和来源／摘要存储对象；不调用 LLM。
     def __init__(self, wiki_dir: Path, search_mode: str = 'bm25', reranker=None):
         if search_mode not in ('bm25', 'exact_then_bm25'):
             raise ValueError('unsupported search mode')
@@ -53,6 +54,8 @@ class WikiRetriever:
         self.summaries = SummaryStore(self.wiki_dir)
         self.related_summaries: dict[str, list[str]] = {}
 
+    # 【索引刷新】扫描非隐藏、非符号链接的实际文件，用路径/mtime/size 判断是否变化；解析 Markdown、目录及摘要状态，再重建倒排索引和反向摘要导航。
+    # 坏元数据降级为正文并记录错误。
     def load(self) -> None:
         # stat snapshots include untracked files, deletions and new directories.
         files = sorted(p for p in self.wiki_dir.rglob('*')
@@ -97,6 +100,7 @@ class WikiRetriever:
         self._build_bm25()
         self._signature = signature
 
+    # 【页面解析】转换为 WikiPage；普通页抽取标题、别名、标签及链接，原文版本页补侧车元数据，摘要页检查新鲜度并仅以可用概览作为正文。
     def _parse_page(self, stem: str, rel: Path, text: str) -> WikiPage:
         meta, body = frontmatter(text)
         if rel.as_posix().startswith('summaries/'):
@@ -111,6 +115,7 @@ class WikiRetriever:
             sidecar = self.wiki_dir / rel.with_suffix('.json')
             if sidecar.is_file():
                 meta = {**meta, **json.loads(sidecar.read_bytes().decode('utf-8'))}
+        # 【字段兼容】把元数据中的列表或单个值转成字符串列表，缺失或空值返回 []。
         def strings(key):
             value = meta.get(key, [])
             return [str(x) for x in value] if isinstance(value, list) else [str(value)] if value else []
@@ -123,14 +128,18 @@ class WikiRetriever:
         return WikiPage(str(meta.get('title') or meta.get('source_title') or stem), str(rel.parent), rel.as_posix(), text, body,
                         strings('aliases'), strings('tags'), description, list(dict.fromkeys(links)), meta)
 
+    # 【词法分词】casefold 后用 Unicode 字母数字片段分词；不做语义向量、词干化或中文词语切分，连续中文可能成为一个 token。
     @staticmethod
     def _tokenize(text: str) -> list[str]:
         return re.findall(r'[^\W_]+', text.casefold(), re.UNICODE)
 
+    # 【名称归一】连字符替为空格，再分词拼回字符串；用于完整标题／别名匹配，不证明两个同名条目是同一实体。
     @classmethod
     def _entity_key(cls, text: str) -> str:
         return ' '.join(cls._tokenize(text.replace('-', ' ')))
 
+    # 【索引构建】索引标题、别名、标签、描述及正文和事实 statement；剔除受控 JSON 中的哈希与重复引文，建立词频和文长表。
+    # 这里没有过滤所有被 supersedes 的旧 statement。
     def _build_bm25(self):
         self._inv, self._doc_len = {}, {}
         for rp, page in self.pages.items():
@@ -146,6 +155,7 @@ class WikiRetriever:
                 self._inv.setdefault(word, {})[rp] = tf
         self._avg_dl = max(1, sum(self._doc_len.values()) / max(1, len(self.pages)))
 
+    # 【确定性排序】按词频、逆文档频率和长度归一计算每页 BM25 分数；k1=1.2、b=0.75，无子串额外加分，返回路径到分数的映射。
     def _bm25_score(self, query_tokens):
         scores = {}
         for token in set(query_tokens):
@@ -155,6 +165,8 @@ class WikiRetriever:
                 scores[rp] = scores.get(rp, 0) + idf * tf * 2.2 / (tf + 1.2 * (.25 + .75 * self._doc_len[rp] / self._avg_dl))
         return scores
 
+    # 【候选检索】刷新索引后按 layer、directory 和模式过滤、排序，折叠内容相同的来源副本，再可选重排并截到 limit。
+    # details 也包含来源页；exact_then_bm25 优先完整实体匹配，不是语义搜索。
     def search(self, query: str, limit: int = 10, directory: str = '', mode: str | None = None,
                layer: str = 'all') -> list[SearchResult]:
         self.load()
@@ -196,6 +208,7 @@ class WikiRetriever:
             unique = self.reranker(query, unique)
         return unique[:limit]
 
+    # 【导航入口】返回所有可见实际目录、描述、直接页面数、根页及解析错误；不是把所有子目录页面全文塞进上下文，需 wiki_read 分页浏览。
     def tree(self) -> dict:
         self.load()
         return {'directories': [{'path': d, 'description': desc,
@@ -207,11 +220,14 @@ class WikiRetriever:
                                   'stale': sum(p.metadata.get('summary_status') == 'stale' for p in self.pages.values()),
                                   'read_tool': 'summary_read: overview -> claims -> evidence -> source_read'}}
 
+    # 【兼容输出】把实时 tree 序列化为 JSON 字符串；不使用旧 index.md 概览挑选主题。
     def wiki_map(self) -> str:
         # All actual directories, no sampled index entries or hard-coded topic selection.
         tree = self.tree()
         return json.dumps(tree, ensure_ascii=False)
 
+    # 【目录／页面读取】一次处理 1..15 个路径；目录按页数分页，文件按选定 view/section 的字符分页，并返回整页 revision、链接和来源导航。
+    # facts 视图含历史事实；本函数的窗口坐标不能直接当原文引文坐标。
     def read(self, paths: list[str], section: str | None = None, start: int = 0,
              length: int = 6000, view: str = 'text', page_limit: int = 50) -> list[dict]:
         self.load()
@@ -271,7 +287,8 @@ class WikiRetriever:
                             if (m := re.match(r'^(#{1,6})\s+(.+?)\s*$', line))]
                 matches = [(i, level) for i, level, name in headings if name.casefold() == section.casefold()]
                 if len(matches) != 1:
-                    out.append({'path': rp, 'type': 'error', 'error': 'section missing or ambiguous'})
+                    out.append({'path': rp, 'type': 'error', 'error': 'section missing or ambiguous; omit section to read the whole page',
+                                'available_sections': [name for _, _, name in headings], 'revision': digest(page.text)})
                     continue
                 i, level = matches[0]
                 end_line = next((j for j, lev, _ in headings if j > i and lev <= level), len(lines))
@@ -286,6 +303,8 @@ class WikiRetriever:
                         'related_summaries': self.related_summaries.get(rp, []), 'view': view, 'section': section, **extra})
         return out
 
+    # 【来源导航／兼容写盘】只根据明确 source_article 或来源路径链接获取原文引用；旧 sources/articles 页会被即时归档为不可变快照，所以旧页读取可能写 sources/versions。
+    # 不会凭标题相似猜来源。
     def _source_refs(self, page: WikiPage) -> list[dict]:
         refs = []
         candidates = [page.rel_path] if page.rel_path.startswith(('sources/articles/', 'sources/versions/')) else []
@@ -310,6 +329,8 @@ class WikiRetriever:
                 continue
         return refs
 
+    # 【工具分发】把模型工具名和参数路由到真实 Python 方法，将结果或捕获的 error 序列化成 JSON。
+    # 不会执行模型生成的 Python 代码；entity_lookup 强制 exact 模式。
     def execute_tool(self, name: str, arguments: dict) -> str:
         try:
             if not isinstance(arguments, dict):
@@ -338,6 +359,7 @@ class WikiRetriever:
         return json.dumps(payload, ensure_ascii=False)
 
 
+# 【协议描述】组装 OpenAI 风格的函数名、描述、参数 JSON Schema；它向模型说明如何请求，真正执行和硬校验由本地分发器完成。
 def tool_schema(name, description, properties, required=()):
     return {'type': 'function', 'function': {'name': name, 'description': description,
             'parameters': {'type': 'object', 'properties': properties, 'required': list(required), 'additionalProperties': False}}}

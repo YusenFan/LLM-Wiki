@@ -33,6 +33,8 @@ from wiki_agent import WikiAgent                     # noqa: E402
 from wiki_retriever import WikiRetriever             # noqa: E402
 
 
+# 【QA CLI／间接 LLM】读取前 N 条题目，创建单个 WikiAgent 逐题回答，写 prediction、引用、推理、缺口及轨迹；可接着评估。
+# output 用 w 打开会覆盖同名文件，逐条 flush，不是断点续跑。
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run Retrieval-as-Reasoning QA over a compiled LLM-Wiki."
