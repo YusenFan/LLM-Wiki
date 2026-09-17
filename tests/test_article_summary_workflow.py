@@ -196,8 +196,76 @@ class WorkflowTest(unittest.TestCase):
         with self.config_patches(), patch.object(config, 'get_page_types', return_value={'entities': {}}):
             with patch.object(bench_ingest, 'call_llm_json', return_value={'pages': [self.proposal()]}):
                 stats = bench_ingest.ingest_batch([self.raw, second])
-            self.assertEqual(stats['failed'], 2)
-            self.assertIn('uncited input', stats['errors'][0]['error'])
+            self.assertEqual(stats['success'], 1)
+            self.assertEqual(stats['failed'], 1)
+            self.assertEqual(stats['warnings'][0]['action'], 'retry_individually')
+            self.assertIn('uncited input', stats['warnings'][0]['error'])
+            self.assertEqual(stats['errors'][0]['articles'], ['second.md'])
+            self.assertTrue(bench_ingest._cache_valid(bench_ingest.load_cache()[self.article['version']], self.root))
+
+    def test_coverage_feedback_repairs_complete_batch_before_writes(self):
+        second = self.base / 'second.md'
+        second.write_text('# Second\n\nSecond is a concept.\n')
+        article = archive_article(self.root, second)
+        extra = self.proposal('entities/second.md')
+        extra['facts'] = [{'text': 'Second is a concept.', 'citations': [{'article': article['article']}]}]
+        incomplete = {'pages': [self.proposal()]}
+        complete = {'pages': [self.proposal(), extra]}
+        def generate(prompt, context, **kwargs):
+            self.assertFalse((self.root / 'entities/alpha.md').exists())
+            if 'Validation error:' in context:
+                self.assertIn(article['article'], context)
+                self.assertIn('Second is a concept.', context)
+                self.assertIn('Previous proposal (rejected)', context)
+                return complete
+            return incomplete
+        trace = {}
+        with self.config_patches(), patch.object(config, 'get_page_types', return_value={'entities': {}}), \
+                patch.object(bench_ingest, 'call_llm_json', side_effect=generate) as model:
+            result = bench_ingest._ingest_batch_one([self.raw, second], {}, trace)
+            self.assertEqual(result['success'], 2)
+            self.assertEqual(model.call_count, 2)
+            self.assertEqual(len(trace['attempts']), 2)
+            self.assertIn('uncited input', trace['attempts'][0]['error'])
+            for entry in bench_ingest.load_cache().values():
+                self.assertTrue(bench_ingest._cache_valid(entry, self.root))
+
+    def test_split_reloads_shared_page_and_preserves_first_article(self):
+        second = self.base / 'second.md'
+        second.write_text('# Beta\n\nBeta grew.\n')
+        article = archive_article(self.root, second)
+        initial = {'pages': [self.proposal()]}
+        combined = self.proposal()
+        combined['facts'].append({'text': 'Beta grew.', 'citations': [{'article': article['article']}]})
+        # Three rejected batch proposals, first singleton, fresh selection, second singleton.
+        responses = [initial] * 4 + [{'pages_to_view': ['entities/alpha.md']}, {'pages': [combined]}]
+        with self.config_patches(), patch.object(config, 'get_page_types', return_value={'entities': {}}), \
+                patch.object(bench_ingest, 'call_llm_json', side_effect=responses) as model:
+            stats = bench_ingest.ingest_batch([self.raw, second])
+            self.assertEqual((stats['success'], stats['failed']), (2, 0))
+            self.assertEqual(stats['errors'], [])
+            self.assertEqual(model.call_count, 6)
+            self.assertIn('Alpha founded Beta.', model.call_args.args[1])
+            for entry in bench_ingest.load_cache().values():
+                self.assertTrue(bench_ingest._cache_valid(entry, self.root))
+
+    def test_validation_retries_are_bounded_and_failed_proposals_saved(self):
+        with self.config_patches(), patch.object(config, 'get_page_types', return_value={'entities': {}}), \
+                patch.object(bench_ingest, 'call_llm_json', return_value={'pages': []}) as model:
+            stats = bench_ingest.ingest_batch([self.raw])
+            self.assertEqual(model.call_count, 3)
+            self.assertEqual(stats['failed'], 1)
+            self.assertFalse(config.CACHE_FILE.exists())
+            saved = json.loads(Path(stats['errors'][0]['diagnostic']).read_text())
+            self.assertEqual(len(saved['attempts']), 3)
+            self.assertTrue(all('error' in attempt for attempt in saved['attempts']))
+
+    def test_existing_taxonomy_gains_generic_categories(self):
+        self.write('page_types.yaml', 'page_types:\n  music:\n    description: Music\n')
+        with self.config_patches(), patch.object(config, '_current_dataset', None):
+            config.ensure_wiki_dirs()
+            self.assertTrue({'music', 'entities', 'concepts'} <= set(config.get_page_types()))
+            self.assertTrue((self.root / 'concepts').is_dir())
 
     def test_direct_knowledge_article_access_through_tree(self):
         text, _ = render_knowledge(self.root, self.proposal(), {'entities/alpha.md'})
@@ -315,9 +383,12 @@ class WorkflowTest(unittest.TestCase):
         overview = {'title': 'Alpha and Beta', 'description': 'Founding and location',
                     'tags': ['organizations'], 'summary': 'Alpha founded Beta, an organization in Paris.'}
         with self.config_patches(), patch.object(config, 'get_page_types', return_value={'entities': {}}):
-            with patch.object(bench_ingest, 'call_llm_json', return_value={'pages': [first, second]}), \
+            with patch.object(bench_ingest, 'call_llm_json', return_value={'pages': [first, second]}) as generate, \
                     patch('build_summaries.call_llm_json', return_value=overview):
                 stats = bench_ingest.ingest_batch([self.raw])
+                self.assertIn('entities/example.md', generate.call_args.args[0])
+                self.assertNotIn('concepts/topic.md', generate.call_args.args[0])
+                self.assertIn('Allowed page-type directories: ["entities"]', generate.call_args.args[0])
         self.assertEqual(stats['summaries']['built'], 1)
         retriever = WikiRetriever(self.root)
         summary = next(e['path'] for e in retriever.tree()['entries'] if e.get('layer') == 'summaries')
@@ -334,6 +405,7 @@ class WorkflowTest(unittest.TestCase):
         replies.append({'role': 'assistant', 'content': None, 'tool_calls': [
             {'id': 'finish', 'type': 'function', 'function': {
                 'name': 'finish_answer', 'arguments': json.dumps(proposal)}}]})
+        retriever.summary_mode = 'bm25'  # This offline integration test must never call embeddings.
         result = WikiAgent(retriever, call_llm_with_tools=Mock(side_effect=replies), t_max=4).retrieve('Where is Beta?')
         self.assertEqual(result.answer['prediction'], 'Paris')
         self.assertEqual(result.stop_reason, 'submitted')
@@ -344,7 +416,7 @@ class WorkflowTest(unittest.TestCase):
         before = graph_page()
         self.write('entities/alpha.md', before)
         with self.config_patches(), patch.object(config, 'get_page_types', return_value={'entities': {}}):
-            with patch.object(bench_ingest, 'call_llm_json', side_effect=[{'pages_to_view': []}, {'pages': [self.proposal()]}]):
+            with patch.object(bench_ingest, 'call_llm_json', side_effect=[{'pages_to_view': []}] + [{'pages': [self.proposal()]}] * 3):
                 stats = bench_ingest.ingest_batch([self.raw])
         self.assertEqual(stats['failed'], 1)
         self.assertEqual((self.root / 'entities/alpha.md').read_text(), before)
@@ -357,7 +429,9 @@ class WorkflowTest(unittest.TestCase):
                 result = bench_ingest._ingest_batch_one([self.raw], {})
         self.assertEqual(result['success'], 1)
         self.assertEqual(llm.call_count, 1)
-        self.assertEqual(llm.call_args.args[0], bench_ingest._BUILD_PROMPT)
+        self.assertTrue(llm.call_args.args[0].startswith('Organize the supplied articles'))
+        self.assertIn('entities/example.md', llm.call_args.args[0])
+        self.assertNotIn('PAGE_TYPE/', llm.call_args.args[0])
         self.assertIn('Page types:', llm.call_args.args[1])
 
     def test_article_reference_uses_full_original_content_without_quote_copy(self):

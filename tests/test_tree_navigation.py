@@ -48,7 +48,7 @@ class TreeNavigationTest(unittest.TestCase):
         self.assertIn('people/directors', retriever.wiki_map())
         self.assertEqual(retriever.tree('people/directors')['entries'][0]['title'], 'Scott Derrickson')
         self.assertEqual({tool['function']['name'] for tool in WIKI_TOOL_SCHEMAS},
-                         {'wiki_tree', 'wiki_read', 'source_read'})
+                         {'summary_search', 'wiki_tree', 'wiki_read', 'source_read'})
         self.assertFalse(hasattr(retriever, 'search'))
 
     def test_tree_pagination_covers_every_file_and_validates_boundaries(self):

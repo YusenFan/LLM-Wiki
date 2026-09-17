@@ -50,6 +50,15 @@ def main() -> None:
                         help="Model for the unified retrieval and answer agent (default: LLM_PREMIUM_MODEL).")
     parser.add_argument("--answer-model", default=None,
                         help="Deprecated alias for --retrieval-model; the unified loop uses one model.")
+    parser.add_argument("--summary-mode", choices=["hybrid", "bm25", "dense", "tree"], default="hybrid",
+                        help="Initial summary retrieval method (default hybrid); tree is the navigation baseline.")
+    parser.add_argument("--summary-limit", type=int, default=5, help="Summaries initially shown, 1-10 (default 5).")
+    parser.add_argument("--summary-candidates", type=int, default=20,
+                        help="Candidates per retriever before RRF (default 20).")
+    parser.add_argument("--summary-token-budget", type=int, default=4000,
+                        help="Max serialized tokens per summary_search/wiki_read response, 512-16000 (default 4000).")
+    parser.add_argument("--embedding-model", default=None,
+                        help="Embedding model; defaults to EMBEDDING_MODEL or text-embedding-3-small.")
     parser.add_argument("--output", "-o", default=None,
                         help="Predictions output path (default: results/<dataset>/predictions.jsonl).")
     parser.add_argument("--evaluate", action="store_true",
@@ -59,6 +68,10 @@ def main() -> None:
 
     if args.t_max < 1:
         parser.error("t-max must be positive")
+    if not 1 <= args.summary_limit <= 10 or not args.summary_limit <= args.summary_candidates <= 200:
+        parser.error("summary-limit must be 1-10 and summary-candidates must be between summary-limit and 200")
+    if not 512 <= args.summary_token_budget <= 16000:
+        parser.error("summary-token-budget must be 512-16000")
     if args.answer_model and args.retrieval_model and args.answer_model != args.retrieval_model:
         parser.error("the unified agent uses one model; choose --retrieval-model only")
 
@@ -82,16 +95,20 @@ def main() -> None:
 
     print(f"Wiki dir : {wiki_dir}")
     print(f"QA pairs : {len(qa_pairs)}")
-    print(f"T_max={args.t_max}  navigation=directory-tree")
+    print(f"T_max={args.t_max}  summary_mode={args.summary_mode}  "
+          f"summary_limit={args.summary_limit}  navigation_token_budget={args.summary_token_budget}")
 
     # 3. Initialize retriever + agent.
-    retriever = WikiRetriever(wiki_dir)
+    retrieval_model = args.retrieval_model or args.answer_model or getattr(config, "LLM_PREMIUM_MODEL", None) or config.LLM_MODEL
+    retriever = WikiRetriever(wiki_dir, summary_mode=args.summary_mode, summary_limit=args.summary_limit,
+                              summary_candidates=args.summary_candidates,
+                              summary_token_budget=args.summary_token_budget,
+                              embedding_model=args.embedding_model, tokenizer_model=retrieval_model)
     retriever.load()
     print(f"Loaded   : {len(retriever.pages)} pages, {len(retriever.dir_indexes)} directory indices")
-    if not any(page.layer == "articles" for page in retriever.pages.values()):
-        parser.error("this wiki has no article evidence; rebuild from processed articles using --wiki-dir")
+    if not any(page.layer in {"knowledge", "articles"} for page in retriever.pages.values()):
+        parser.error("this wiki has no knowledge pages or article evidence; rebuild using --wiki-dir")
 
-    retrieval_model = args.retrieval_model or args.answer_model or getattr(config, "LLM_PREMIUM_MODEL", None) or config.LLM_MODEL
     agent = WikiAgent(
         retriever,
         call_llm_with_tools=call_llm_with_tools,
@@ -109,6 +126,7 @@ def main() -> None:
     t0 = time.time()
     with open(out_path, "w", encoding="utf-8") as fout:
         for i, qa in enumerate(qa_pairs, 1):
+            question_started = time.time()
             question = qa["question"]
             rr = None
             error = None
@@ -129,12 +147,21 @@ def main() -> None:
                 "retrieval_trace": rr.trace if rr else [],
                 "retrieval_steps": rr.total_calls if rr else 0,
                 "article_evidence": rr.evidence if rr else [],
+                "knowledge_evidence": rr.page_evidence if rr else [],
                 "retrieval_llm_calls": rr.llm_calls if rr else 0,
                 "retrieval_usage_by_model": rr.usage_by_model if rr else {},
                 "evidence_requirements": rr.requirements if rr else [],
                 "evidence_gaps": [item for item in rr.requirements if item["status"] == "unresolved"] if rr else [],
                 "stop_reason": rr.stop_reason if rr else "error",
                 "tool_calls": rr.tool_calls if rr else [],
+                "initial_navigation": rr.initial_navigation if rr else {},
+                "summary_searches": rr.summary_searches if rr else [],
+                "embedding_usage": rr.embedding_usage if rr else {},
+                "elapsed_seconds": round(time.time() - question_started, 3),
+                "retrieval_config": {"summary_mode": args.summary_mode, "summary_limit": args.summary_limit,
+                                     "summary_candidates": args.summary_candidates,
+                                     "summary_token_budget": args.summary_token_budget,
+                                     "tokenizer": retriever.tokenizer.name},
                 "error": error,
             }
             fout.write(json.dumps(record, ensure_ascii=False) + "\n")

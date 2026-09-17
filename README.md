@@ -4,9 +4,9 @@
 
 This repository is based on the official code release for **LLM-Wiki**, an
 agent-native retrieval system that operationalizes the
-*Retrieval-as-Reasoning* paradigm. LLM-Wiki compiles documents into
-structured Wiki pages. This local refactor exposes `wiki_tree`, `wiki_read`
-and `source_read` through tool-calling interfaces, with direct article citations
+_Retrieval-as-Reasoning_ paradigm. LLM-Wiki compiles documents into
+structured Wiki pages. This local refactor exposes `summary_search`, `wiki_tree`, `wiki_read`
+and `source_read` through tool-calling interfaces, with knowledge-page or original-article citations
 and related-page summaries. The original Error Book module is retained but is
 not invoked by the new ingestion pipeline. Offline Wiki compilation and online
 retrieval / question answering / evaluation remain separate stages.
@@ -38,7 +38,10 @@ release/
 │   ├── build_summaries.py   # related-page grouping + summary generation
 │   ├── bench_error_book.py   # retained legacy error-book module
 │   ├── run.py                # offline wiki construction runner
-│   ├── wiki_retriever.py     # wiki_tree + wiki_read + source_read tools
+│   ├── summary_retrieval.py  # summary BM25 + dense + RRF
+│   ├── embedding_client.py   # cached OpenAI-compatible embeddings
+│   ├── token_budget.py       # token-bounded navigation payloads
+│   ├── wiki_retriever.py     # summary_search + tree + page/article tools
 │   ├── wiki_agent.py         # Retrieval-as-Reasoning tool-calling agent
 │   ├── run_qa.py             # end-to-end retrieval + answer runner
 │   └── evaluate.py           # EM / F1 evaluation
@@ -83,25 +86,43 @@ The compiled wiki is written to `wiki_output/<dataset>/wiki/`.
 ## Run retrieval & answer evaluation
 
 Once a wiki has been compiled, the agent can traverse it to answer questions.
-The agent starts with an unranked directory tree, chooses files with `wiki_tree`
-and `wiki_read`, follows wikilinks,
-and reads article passages before producing a final answer in the same conversation.
+The agent starts with a token-bounded batch of current summaries, retrieved using
+BM25 and dense embeddings with reciprocal rank fusion (RRF). It can requery
+`summary_search` for missing evidence, choose files with `wiki_tree` and `wiki_read`, follow wikilinks,
+and answers directly from sufficient knowledge-page facts. Original article reads are optional
+for missing details, ambiguity, conflicts, or explicit verification requests.
 `update_evidence_state` records unresolved/supported requirements; `finish_answer`
-submits an answer with exact article citations. Rejected submissions return tool
+submits an answer with exact knowledge-page quotes or article citations. Rejected submissions return tool
 errors so the agent can correct them or retrieve more evidence within budget.
-See [the unified QA loop](docs/qa-agent-loop.md) for state and stopping rules,
+See [summary hybrid retrieval](docs/summary-hybrid-retrieval.md) for configuration, caching and budgets,
+[the unified QA loop](docs/qa-agent-loop.md) for state and stopping rules,
 and [directory navigation](docs/wiki-tree-navigation.md) for tools and filename migration.
 
 The current local refactor uses **article → cited knowledge page → high-level
-summary**. It replaces digest generation and its automatic repair pipeline.
+summary**. It replaces digest generation and its automatic repair pipeline. Article generation retries
+rejected proposals with validation feedback up to twice, then retries failed
+multi-article batches one article at a time. Every attempt must pass the same
+citation and path checks before any knowledge page is written. Reports count
+only unresolved articles as failed; recovered batch failures appear as warnings
+with diagnostic files containing the rejected attempts. Successful articles remain
+cached. Wiki initialization retains generic `entities` and `concepts` categories
+alongside specialized page types.
 See [the code review guide](docs/wiki-agent-implementation.md) for every changed
 function, the reasons behind it, and the retired behavior. The exact contracts
 are in [the wiki schema](configs/wiki-schema.md).
 
 The tool-call budget is `T_max = 15` by default. State updates, rejected calls,
 and answer submission count toward it; the last slot is reserved for submission.
-Each turn reports the remaining budget and evidence requirements. Search scoring,
-BM25, `wiki_search`, and the old `--patience`/`--select-pages` parameters are removed.
+Each turn reports the remaining budget and evidence requirements. Initial summary
+retrieval is a separate bootstrap operation, logged with its embedding usage; subsequent
+`summary_search` calls consume the tool budget. The old custom field bonuses,
+`wiki_search`, and `--patience`/`--select-pages` remain removed.
+Use `--summary-mode hybrid|bm25|dense|tree` for controlled comparisons (default `hybrid`).
+Defaults: 20 candidates per retriever, up to 5 summaries, and 4000 tokens per
+summary/page response, including its JSON metadata. `--embedding-model` defaults
+to `EMBEDDING_MODEL` or `text-embedding-3-small`; the embedding endpoint/credentials
+default to the chat configuration. Dense failure is explicitly recorded and hybrid
+mode falls back to BM25. Directory browsing remains available for uncovered pages.
 `--retrieval-model` now selects the model for the entire QA loop. `--answer-model`
 is a deprecated alias; supplying two different models is rejected. The new evidence-only answer policy differs from the original paper
 runner: it does not fill gaps from model knowledge. Old benchmark results must
@@ -143,9 +164,11 @@ python -m llm_wiki_bench.run_qa --dataset hotpotqa --limit 500 --evaluate
 
 Results (predictions, summary, per-question details) are written under
 `results/<dataset>/`.
-Each prediction now includes `article_evidence`, `evidence_chain`,
+Each prediction now includes `knowledge_evidence`, `article_evidence`, `evidence_chain`,
 `evidence_status`, and `error`. `citations_validated` means the quotes and
-locations match the passages read; it does not certify semantic support.
+locations match the excerpts read; it does not certify semantic support. Knowledge-page
+citations use `{page, quote}`; original-article citations retain
+`{article, version, start_line, end_line, quote}`. Summaries are navigation only.
 
 Offline checks (no LLM calls):
 

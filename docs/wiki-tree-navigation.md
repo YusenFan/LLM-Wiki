@@ -1,13 +1,13 @@
 # Wiki 目录树导航
 
-QA agent 通过文件目录自主选择阅读内容。初始消息包含当前可读页面的两层目录树和标题；需要更多内容时调用 `wiki_tree`。没有 BM25、自定义字段权重、top-k 搜索或自动按分数选文件。
+QA agent 保留文件目录浏览能力。默认入口现已改为 [摘要混合检索](summary-hybrid-retrieval.md)：先检索少量 summary，再选择知识页与原文。`wiki_tree` 用于局部浏览和遗漏证据补查。使用 `--summary-mode tree` 可切回原有目录入口做对照；只有该模式在初始消息加载两层目录树。目录列表自身不使用相关性分数。
 
 ```text
-问题 + Wiki 文件目录树
+问题 + 检索所得摘要（或显式 tree 模式的目录树）
   → LLM 选择路径
   → wiki_tree：展开目录 / 分页（按需）
   → wiki_read：阅读选中的摘要或知识页
-  → source_read：读取链接中的原文
+  → source_read：信息不足或需要核验时，按需读取链接中的原文
   → 同一 agent 更新证据状态、补查或 finish_answer
 ```
 
@@ -16,12 +16,12 @@ QA agent 通过文件目录自主选择阅读内容。初始消息包含当前�
 ## 工具
 
 - `wiki_tree(path="/", depth=2, offset=0, limit=100)`：返回 path、depth、entries、total、next_offset。每项包含 path、type，文件还有 title、layer。目录按路径排序，不提供相关性分数。
-- `wiki_read(paths)`：批量阅读选中文件。摘要与知识页是导航；原文文件返回路径与行数，提示调用 source_read。
+- `wiki_read(paths, offset=0)`：在 token 预算内阅读 1–10 个选中文件。返回截断标记和字符 next_offset；续读时只传一个 path。摘要用于导航，知识页可直接支撑答案；原文文件返回路径与行数，提示按需调用 source_read。
 - `source_read(article, start_line, end_line)`：读取原文，返回实际路径、版本和引文。
 
-`depth` 范围为 1–10，`limit` 为 1–200。大目录可按子目录展开，或使用同一 path/depth 和 next_offset 继续。初始树最多展示 200 项，并明确提示后续分页入口。隐藏构建文件、旧 digest 和失效摘要不进入 QA 目录视图。
+`depth` 范围为 1–10，`limit` 为 1–200。大目录可按子目录展开，或使用同一 path/depth 和 next_offset 继续。tree 对照模式的初始树最多展示 200 项，并明确提示后续分页入口。隐藏构建文件、旧 digest 和失效摘要不进入 QA 目录视图。
 
-`wiki_search`、搜索打分代码、倒排索引，以及 QA 的 `--patience` 和 `--select-pages` 参数已移除。`--t-max`、证据状态和答案提交规则继续使用。
+旧 `wiki_search`、自定义字段打分，以及 QA 的 `--patience` 和 `--select-pages` 参数已移除。新的 `summary_search` 只检索有效摘要，使用标准 BM25/dense/RRF。`--t-max`、证据状态和答案提交规则继续使用。
 
 ## 文件命名
 

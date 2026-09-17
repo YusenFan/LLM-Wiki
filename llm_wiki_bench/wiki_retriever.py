@@ -1,8 +1,4 @@
-"""Navigate the Wiki directory tree and read exact article evidence.
-
-wiki_tree lists readable paths without ranking. wiki_read opens navigation
-pages, and source_read returns exact article ranges. No search scoring is used.
-"""
+"""Retrieve current summaries, navigate files, and read exact article evidence."""
 
 from __future__ import annotations
 
@@ -13,6 +9,9 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from build_summaries import current_summaries
+from embedding_client import EmbeddingClient
+from summary_retrieval import SummaryIndex
+from token_budget import TokenBudget, dumps
 from wiki_documents import ARTICLE_PREFIX, parse_document, read_article, resolve_wiki_link, wiki_path
 
 _logger = logging.getLogger("llm_wiki.retriever")
@@ -45,8 +44,26 @@ class WikiPage:
 class WikiRetriever:
     """Expose directory traversal and explicit page/article reads."""
 
-    def __init__(self, wiki_dir: Path):
+    def __init__(self, wiki_dir: Path, *, summary_mode: str = "hybrid", summary_limit: int = 5,
+                 summary_token_budget: int = 4000, summary_candidates: int = 20,
+                 embedding_model: str | None = None, tokenizer_model: str = "gpt-4o", embedder=None):
+        if summary_mode not in {"tree", "bm25", "dense", "hybrid"}:
+            raise ValueError("summary mode must be tree, bm25, dense or hybrid")
+        if type(summary_limit) is not int or not 1 <= summary_limit <= 10:
+            raise ValueError("summary limit must be 1-10")
+        if type(summary_token_budget) is not int or not 512 <= summary_token_budget <= 16000:
+            raise ValueError("summary token budget must be 512-16000")
+        if type(summary_candidates) is not int or not summary_limit <= summary_candidates <= 200:
+            raise ValueError("summary candidates must be between summary limit and 200")
         self.wiki_dir = Path(wiki_dir)
+        self.summary_mode = summary_mode
+        self.summary_limit = summary_limit
+        self.summary_token_budget = summary_token_budget
+        self.summary_candidates = summary_candidates
+        self.tokenizer = TokenBudget(tokenizer_model)
+        self.embedder = embedder if embedder is not None else EmbeddingClient(
+            self.wiki_dir / ".build" / "retrieval-embeddings.sqlite3", model=embedding_model)
+        self.summary_index = None
         self.pages: dict[str, WikiPage] = {}
         self.dir_indexes: dict[str, str] = {}        # dir_name → _index.md content
         self._loaded = False
@@ -106,6 +123,30 @@ class WikiRetriever:
             "loaded wiki: %d pages, %d directory indices",
             len(self.pages), len(self.dir_indexes),
         )
+
+    def summary_search(self, query: str, limit: int | None = None, offset: int = 0,
+                       exclude_paths: list[str] | None = None) -> dict:
+        """Return a token-bounded batch; agent may reformulate, page or exclude seen summaries."""
+        self.load()
+        if self.summary_mode == "tree":
+            raise ValueError("Summary retrieval is disabled in tree mode; use wiki_tree")
+        if self.summary_index is None:
+            self.summary_index = SummaryIndex(self.pages, mode=self.summary_mode,
+                                              candidate_k=self.summary_candidates, embedder=self.embedder)
+        return self.summary_index.search(query, tokenizer=self.tokenizer,
+                                         limit=self.summary_limit if limit is None else limit,
+                                         token_budget=self.summary_token_budget, offset=offset,
+                                         exclude_paths=exclude_paths)
+
+    def initial_navigation(self, question: str) -> dict:
+        if self.summary_mode == "tree":
+            return {"mode": "tree", "directory_tree": self.wiki_map()}
+        return self.summary_search(question)
+
+    @property
+    def tool_schemas(self) -> list[dict]:
+        return [tool for tool in WIKI_TOOL_SCHEMAS
+                if self.summary_mode != "tree" or tool["function"]["name"] != "summary_search"]
 
     def _parse_page(self, stem: str, rel: Path, text: str) -> WikiPage:
         dir_name = str(rel.parent) if str(rel.parent) != "." else ""
@@ -183,13 +224,17 @@ class WikiRetriever:
 
     # ── read ──────────────────────────────────────────────────────────────
 
-    def read(self, paths: list[str]) -> list[dict]:
+    def read(self, paths: list[str], offset: int = 0) -> list[dict]:
         """Batch-read directory indices or page files.
 
         * `"/"`            → list of available top-level directories
         * `"entities"`     → directory `_index.md` (or page list)
         * `"entities/X.md"` → full page text + metadata
         """
+        if not isinstance(paths, list) or not 1 <= len(paths) <= 10 or any(not isinstance(p, str) for p in paths):
+            raise ValueError("paths must contain 1-10 Wiki paths")
+        if type(offset) is not int or offset < 0 or (offset and len(paths) != 1):
+            raise ValueError("offset must be nonnegative; continue only one path at a time")
         self.load()
         out: list[dict] = []
         for raw in paths:
@@ -213,13 +258,9 @@ class WikiRetriever:
                 out.append({
                     "path": p,
                     "type": "file",
-                    "name": page.name,
-                    "text": page.text,
+                    "name": self.tokenizer.prefix(page.name, 80),
+                    "text": page.body,
                     "meta": {
-                        "aliases": page.aliases,
-                        "tags": page.tags,
-                        "description": page.description,
-                        "links_to": page.links_to,
                         "layer": page.layer,
                     },
                 })
@@ -234,10 +275,22 @@ class WikiRetriever:
             prefix = p + "/"
             pages_in_dir = [pg.name for rel, pg in self.pages.items() if rel.startswith(prefix)]
             if pages_in_dir:
-                out.append({"path": p, "type": "directory", "name": p, "pages": pages_in_dir})
+                out.append({"path": p, "type": "directory", "name": p, "text": "\n".join(pages_in_dir)})
             else:
                 out.append({"path": p, "type": "error", "error": "not found"})
-        return out
+        per_row = (self.summary_token_budget - 64) // len(out) - 8
+        bounded = []
+        for item in out:
+            if "text" in item:
+                text = item["text"]
+                if offset > len(text):
+                    bounded.append({"path": item["path"], "error": "offset exceeds page length"})
+                    continue
+                item = {**item, "text": text[offset:], "start_offset": offset, "total_chars": len(text)}
+            bounded.append(self.tokenizer.fit_row(item, per_row))
+        if self.tokenizer.count(dumps(bounded)) > self.summary_token_budget:
+            raise ValueError("Batch metadata exceeds read budget; request fewer paths")
+        return bounded
 
     # ── helpers ───────────────────────────────────────────────────────────
 
@@ -260,7 +313,7 @@ class WikiRetriever:
     def wiki_map(self) -> str:
         """Seed the agent with an unranked directory tree, with explicit expansion guidance."""
         listing = self.tree(depth=2, limit=200)
-        lines = ["# Wiki directory tree", "Files are navigation entries, not evidence.",
+        lines = ["# Wiki directory tree", "Directory entries are navigation; read knowledge pages to obtain evidence.",
                  "Use wiki_tree(path, depth, offset) to expand directories or continue a listing."]
         for entry in listing["entries"]:
             indent = "  " * (len(entry["path"].split("/")) - 1)
@@ -276,12 +329,15 @@ class WikiRetriever:
 
     def execute_tool(self, name: str, arguments: dict) -> str:
         """Run a single tool call and return a JSON string."""
+        if name == "summary_search":
+            return dumps(self.summary_search(arguments.get("query", ""), arguments.get("limit"),
+                                             arguments.get("offset", 0), arguments.get("exclude_paths")))
         if name == "wiki_tree":
             return json.dumps(self.tree(arguments.get("path", "/"), arguments.get("depth", 2),
                                         arguments.get("offset", 0), arguments.get("limit", 100)), ensure_ascii=False)
         if name == "wiki_read":
-            return json.dumps(self.read(arguments.get("paths") or arguments.get("dirs") or []),
-                              ensure_ascii=False)
+            return dumps(self.read(arguments.get("paths") or arguments.get("dirs") or [],
+                                   arguments.get("offset", 0)))
 
         if name == "source_read":
             return json.dumps(self.source_read(arguments.get("article", ""),
@@ -294,6 +350,23 @@ class WikiRetriever:
 # ─── OpenAI tool schemas exposed to the agent ─────────────────────────────
 
 WIKI_TOOL_SCHEMAS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "summary_search",
+            "description": "Find current summaries for an unresolved entity or relation, using configured BM25/dense/hybrid retrieval. Returns budgeted summary text and member paths, never final evidence. Rephrase the query for another hop, page with next_offset, or exclude already-read summaries. If summaries miss evidence, use wiki_tree and wiki_read directly.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Specific missing fact/entity; at most 512 tokens"},
+                    "limit": {"type": "integer", "description": "1-10 summaries; default configured limit (5)"},
+                    "offset": {"type": "integer", "description": "Candidate offset from previous next_offset; same query and exclusions"},
+                    "exclude_paths": {"type": "array", "items": {"type": "string"}, "description": "Already-read summary paths; use offset=0 when changing exclusions"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -315,13 +388,14 @@ WIKI_TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "wiki_read",
             "description": (
-                "Batch-read directory indices (_index.md) or full pages. For knowledge "
-                "pages, the returned content includes inter-page wikilinks that serve "
-                "as traversal affordances for subsequent hops."
+                "Read 1-10 navigation pages within the configured token budget. Follow article links for evidence. "
+                "Text may be truncated: continue a single path with next_offset (character offset into page body). "
+                "For a directory, prefer wiki_tree pagination."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "offset": {"type": "integer", "description": "Character offset into the page body; use returned next_offset with a single path"},
                     "paths": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -341,7 +415,7 @@ WIKI_TOOL_SCHEMAS.append({
     "type": "function",
     "function": {
         "name": "source_read",
-        "description": "Read exact article lines as final evidence. Follow #Lx-Ly references from knowledge pages; read evidence for every hop.",
+        "description": "Optionally read original article lines for missing details, ambiguity, conflicts, or original-source verification. Knowledge-page evidence is sufficient when it explicitly answers the question.",
         "parameters": {
             "type": "object",
             "properties": {

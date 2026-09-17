@@ -322,6 +322,12 @@ def ensure_wiki_dirs() -> None:
         except Exception:
             save_page_types(DEFAULT_PAGE_TYPES)
 
+    # Specialized auto-generated taxonomies must retain a home for arbitrary benchmark inputs.
+    page_types = get_page_types()
+    missing = {name: DEFAULT_PAGE_TYPES[name] for name in ("entities", "concepts") if name not in page_types}
+    if missing:
+        save_page_types({**page_types, **missing})
+
     for name, dir_path in get_page_dirs().items():
         dir_path.mkdir(parents=True, exist_ok=True)
 

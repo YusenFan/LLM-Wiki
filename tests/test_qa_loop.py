@@ -10,6 +10,7 @@ import llm_wiki_bench
 from wiki_agent import WikiAgent, RetrievalResult
 from wiki_documents import archive_article, read_article
 from wiki_retriever import WikiRetriever
+from qa_contract import validate_answer
 import run_qa
 
 
@@ -57,6 +58,98 @@ class QALoopTest(unittest.TestCase):
             return next(script)
         result = WikiAgent(self.retriever, call_llm_with_tools=model, t_max=budget).retrieve('Where is the company Alpha founded?')
         return result, snapshots
+
+    def knowledge_page(self, text='Alpha founded Beta. Beta is in Paris.'):
+        path = self.root / 'entities/alpha.md'
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(text)
+        return 'entities/alpha.md'
+
+    def page_finish(self, page, quote):
+        citation = {'page': page, 'quote': quote}
+        return call('finish_answer', answer='Paris', requirements=[self.req('location', citation)],
+                    evidence_chain=[{'requirement_id': 'location', 'claim': quote, 'citations': [citation]}])
+
+    def test_knowledge_page_answers_without_original_read(self):
+        page = self.knowledge_page()
+        result, _ = self.run_script([
+            reply(call('wiki_read', paths=[page])),
+            reply(self.page_finish(page, 'Beta is in Paris.')),
+        ], budget=2)
+        self.assertEqual(result.answer['prediction'], 'Paris')
+        self.assertEqual(result.evidence, [])
+        self.assertEqual(len(result.page_evidence), 1)
+        self.assertEqual(result.answer['evidence_chain'][0]['citations'],
+                         [{'page': page, 'quote': 'Beta is in Paris.'}])
+
+    def test_unread_knowledge_page_requires_read_before_submission(self):
+        page = self.knowledge_page()
+        result, _ = self.run_script([
+            reply(self.page_finish(page, 'Beta is in Paris.')),
+            reply(call('wiki_read', paths=[page])),
+            reply(self.page_finish(page, 'Beta is in Paris.')),
+        ])
+        self.assertIn('unread', result.tool_calls[0]['result'])
+        self.assertEqual(result.answer['prediction'], 'Paris')
+
+    def test_page_evidence_can_be_supplemented_with_original(self):
+        page = self.knowledge_page('Alpha founded Beta.')
+        first = {'page': page, 'quote': 'Alpha founded Beta.'}
+        result, _ = self.run_script([
+            reply(call('wiki_read', paths=[page])),
+            reply(self.read(2)),
+            reply(call('finish_answer', answer='Paris',
+                       requirements=[self.req('founder', first), self.req('location', self.second)],
+                       evidence_chain=[{'requirement_id': rid, 'claim': cit['quote'], 'citations': [cit]}
+                                       for rid, cit in [('founder', first), ('location', self.second)]])),
+        ])
+        self.assertEqual(result.answer['prediction'], 'Paris')
+        self.assertEqual(len(result.evidence), 1)
+        self.assertEqual(len(result.page_evidence), 1)
+
+    def test_truncated_unread_text_rejected_until_continuation(self):
+        body = 'Alpha founded Beta.\n' * 1000 + 'Beta is in Paris.'
+        page = self.knowledge_page(body)
+        self.retriever.summary_token_budget = 400
+        result, _ = self.run_script([
+            reply(call('wiki_read', paths=[page])),
+            reply(self.page_finish(page, 'Beta is in Paris.')),
+            reply(call('wiki_read', paths=[page], offset=len(body) - len('Beta is in Paris.'))),
+            reply(self.page_finish(page, 'Beta is in Paris.')),
+        ])
+        self.assertIn('unread', result.tool_calls[1]['result'])
+        self.assertEqual(result.answer['prediction'], 'Paris')
+        self.assertEqual(len(result.page_evidence), 2)
+
+    def test_page_quote_cannot_be_paraphrased_or_disguised_as_article(self):
+        page = self.knowledge_page()
+        result, _ = self.run_script([
+            reply(call('wiki_read', paths=[page])),
+            reply(self.page_finish(page, 'Beta is located in Paris.')),
+            reply(self.page_finish(page, 'Beta is in Paris.')),
+        ])
+        self.assertIn('quote does not match', result.tool_calls[1]['result'])
+        proposal = copy.deepcopy(result.answer)
+        proposal['answer'] = proposal.pop('prediction')
+        proposal['evidence_chain'][0]['citations'][0]['article'] = self.article
+        with self.assertRaisesRegex(ValueError, 'do not mix'):
+            validate_answer(proposal, [], result.page_evidence)
+
+    def test_summary_and_directory_reads_are_not_answer_evidence(self):
+        page = self.knowledge_page()
+        self.retriever.load()
+        summary = 'summaries/example.md'
+        self.retriever.pages[summary] = self.retriever._parse_page(
+            'example', Path(summary), 'Beta is in Paris.')
+        result, _ = self.run_script([
+            reply(call('wiki_read', paths=[summary, 'entities'])),
+            reply(self.page_finish(summary, 'Beta is in Paris.')),
+            reply(self.page_finish(page, 'Beta is in Paris.')),
+            reply(call('finish_answer', answer='unknown', requirements=[], evidence_chain=[])),
+        ])
+        self.assertEqual(result.page_evidence, [])
+        self.assertIn('unread', result.tool_calls[1]['result'])
+        self.assertIn('unread', result.tool_calls[2]['result'])
 
     def test_gap_rejects_early_answer_then_second_hop_completes(self):
         result, snapshots = self.run_script([
@@ -140,12 +233,15 @@ class QALoopTest(unittest.TestCase):
         self.assertNotIn('wiki_search', names)
 
     def test_runner_uses_agent_answer_and_persists_state(self):
+        self.knowledge_page()
+        (self.root / self.article).unlink()  # knowledge-only Wiki is a valid QA input
         qa_dir = self.base / 'data/hotpotqa'
         qa_dir.mkdir(parents=True)
         (qa_dir / 'qa_pairs.jsonl').write_text(json.dumps({'id': 'q1', 'question': 'q', 'answer': 'Paris'}) + '\n')
         output = self.base / 'predictions.jsonl'
         result = RetrievalResult(answer={'prediction': 'Paris', 'evidence_chain': [], 'evidence_status': 'citations_validated'},
-                                 requirements=[self.req('location')], stop_reason='submitted')
+                                 requirements=[self.req('location')], stop_reason='submitted',
+                                 page_evidence=[{'page': 'entities/alpha.md', 'text': 'Beta is in Paris.', 'start_offset': 0}])
         with patch.object(run_qa.config, 'BASE_DIR', self.base), \
              patch.object(run_qa.config, 'WIKI_DIR', self.root), \
              patch.object(run_qa.config, 'set_dataset'), patch.object(run_qa.config, 'ensure_wiki_dirs'), \
@@ -157,6 +253,8 @@ class QALoopTest(unittest.TestCase):
         self.assertEqual(saved['prediction'], 'Paris')
         self.assertEqual(saved['evidence_gaps'], result.requirements)
         self.assertEqual(saved['stop_reason'], 'submitted')
+        self.assertEqual(saved['knowledge_evidence'], result.page_evidence)
+        self.assertEqual(saved['article_evidence'], [])
 
 
 if __name__ == '__main__':

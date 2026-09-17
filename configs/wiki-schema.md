@@ -39,12 +39,15 @@ tags: [history]
 > Alpha and its organization
 
 ## Core Facts
+
 - Alpha founded Beta. [[sources/articles/<sha256>]]
 
 ## Related Pages
+
 - [[entities/beta]] — organization founded by Alpha
 
 ## Related Sources
+
 - [[sources/articles/<sha256>]]
 ```
 
@@ -94,6 +97,7 @@ fingerprint: <hash of member paths and current content>
 A high-level overview of the supplied knowledge pages.
 
 ## Member Pages
+
 - [[entities/alpha]]
 - [[entities/beta]]
 
@@ -108,10 +112,17 @@ and regenerated summary indexes.
 
 ## QA contract
 
+- Initial navigation retrieves current summaries with BM25/dense/RRF (default hybrid),
+  at most 5 summaries within a 4000-token serialized payload budget. This is navigation, not proof.
+- `summary_search(query, limit?, offset?, exclude_paths?)` allows missing-fact requery,
+  candidate paging, and exclusion of already-read summaries. Only current summaries are indexed;
+  directory traversal remains available for pages with no summary or omitted summary facts.
 - `wiki_tree(path?, depth?, offset?, limit?)` lists unranked directories and files
   with readable titles. Expand a subdirectory or continue with `next_offset`.
-  No BM25 or custom relevance scoring is used.
-- `wiki_read(paths)` opens navigation pages. For an article it returns the path
+  Tree listings do not use relevance scores; summary ranking has no custom field bonuses.
+- `wiki_read(paths, offset?)` opens 1-10 navigation pages within the same token budget.
+  A truncated text returns `next_offset`, a character offset into the Markdown body;
+  continue with one path. For an article it returns the path
   and line count, prompting `source_read` rather than treating navigation as proof.
 - `source_read(article, start_line, end_line)` returns actual article lines and
   the version read. A call reads up to 200 lines, with an 80-line default window.
