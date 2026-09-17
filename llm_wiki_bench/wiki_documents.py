@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Collection
 from pathlib import Path, PurePosixPath
 
 import yaml
@@ -11,6 +12,17 @@ import yaml
 
 ARTICLE_PREFIX = "sources/articles/"
 RESERVED_DIRS = {"sources", "summaries", "syntheses"}
+
+
+def resolve_wiki_link(value: str, known_paths: Collection[str]) -> str:
+    """Resolve a generated wikilink against known paths, without guessing files."""
+    if not isinstance(value, str):
+        raise ValueError("expected a wiki-relative path or wikilink")
+    path = value.strip().removeprefix("[[").removesuffix("]]")
+    path = path.split("|", 1)[0].split("#", 1)[0].strip()
+    if path + ".md" in known_paths:
+        path += ".md"
+    return path
 
 
 def wiki_path(root: Path, value: str) -> Path:

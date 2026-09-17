@@ -1,3 +1,7 @@
+> 2026-09-17 目录导航更新：当前已使用 `wiki_tree`，移除 BM25 和字段加权搜索；摘要采用可读文件名。见 [目录树导航](wiki-tree-navigation.md)。以下搜索相关表格属于历史实现记录。
+
+> 2026-09-17 QA 更新：检索、证据缺口状态和答案提交已合并到同一对话；当前流程、预算和测试见 [统一 QA 循环](qa-agent-loop.md)。下文记录的独立 `_answer()` 阶段已删除，`validate_answer()` 已移动到 `qa_contract.py`。构建与摘要部分不受此次更新影响。
+
 # Article 引用与 Related Pages 摘要：逐项代码审核
 
 > 后续构建修复见 [单题构建修复](build-test-one-fix.md)：知识页现使用 article 级链接，构建不再要求行号或逐字 quote。下文逐行引用的描述记录第一版设计；相关构建行为以修复说明为准。

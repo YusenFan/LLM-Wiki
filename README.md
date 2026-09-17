@@ -5,7 +5,7 @@
 This repository is based on the official code release for **LLM-Wiki**, an
 agent-native retrieval system that operationalizes the
 *Retrieval-as-Reasoning* paradigm. LLM-Wiki compiles documents into
-structured Wiki pages. This local refactor exposes `wiki_search`, `wiki_read`
+structured Wiki pages. This local refactor exposes `wiki_tree`, `wiki_read`
 and `source_read` through tool-calling interfaces, with direct article citations
 and related-page summaries. The original Error Book module is retained but is
 not invoked by the new ingestion pipeline. Offline Wiki compilation and online
@@ -38,7 +38,7 @@ release/
 │   ├── build_summaries.py   # related-page grouping + summary generation
 │   ├── bench_error_book.py   # retained legacy error-book module
 │   ├── run.py                # offline wiki construction runner
-│   ├── wiki_retriever.py     # wiki_search + wiki_read + source_read tools
+│   ├── wiki_retriever.py     # wiki_tree + wiki_read + source_read tools
 │   ├── wiki_agent.py         # Retrieval-as-Reasoning tool-calling agent
 │   ├── run_qa.py             # end-to-end retrieval + answer runner
 │   └── evaluate.py           # EM / F1 evaluation
@@ -83,8 +83,14 @@ The compiled wiki is written to `wiki_output/<dataset>/wiki/`.
 ## Run retrieval & answer evaluation
 
 Once a wiki has been compiled, the agent can traverse it to answer questions.
-The agent composes `wiki_search` and `wiki_read` calls, follows wikilinks,
-and reads article passages before producing a final answer.
+The agent starts with an unranked directory tree, chooses files with `wiki_tree`
+and `wiki_read`, follows wikilinks,
+and reads article passages before producing a final answer in the same conversation.
+`update_evidence_state` records unresolved/supported requirements; `finish_answer`
+submits an answer with exact article citations. Rejected submissions return tool
+errors so the agent can correct them or retrieve more evidence within budget.
+See [the unified QA loop](docs/qa-agent-loop.md) for state and stopping rules,
+and [directory navigation](docs/wiki-tree-navigation.md) for tools and filename migration.
 
 The current local refactor uses **article → cited knowledge page → high-level
 summary**. It replaces digest generation and its automatic repair pipeline.
@@ -92,9 +98,12 @@ See [the code review guide](docs/wiki-agent-implementation.md) for every changed
 function, the reasons behind it, and the retired behavior. The exact contracts
 are in [the wiki schema](configs/wiki-schema.md).
 
-Default budgets: tool-call budget `T_max = 15`, patience
-`P = 3` consecutive empty searches, and at most `k = 5` pages selected per
-search. The new evidence-only answer policy differs from the original paper
+The tool-call budget is `T_max = 15` by default. State updates, rejected calls,
+and answer submission count toward it; the last slot is reserved for submission.
+Each turn reports the remaining budget and evidence requirements. Search scoring,
+BM25, `wiki_search`, and the old `--patience`/`--select-pages` parameters are removed.
+`--retrieval-model` now selects the model for the entire QA loop. `--answer-model`
+is a deprecated alias; supplying two different models is rejected. The new evidence-only answer policy differs from the original paper
 runner: it does not fill gaps from model knowledge. Old benchmark results must
 not be presented as results of this refactor.
 

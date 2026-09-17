@@ -11,7 +11,7 @@ import llm_wiki_bench  # establish the project's sibling-module import path
 import bench_config as config
 import bench_ingest
 from build_summaries import build_summaries, current_summaries, summary_groups, summary_path
-from run_qa import _answer, validate_answer
+from run_qa import validate_answer
 from wiki_agent import WikiAgent
 from wiki_documents import (
     archive_article, article_reference, citation_link, knowledge_pages, parse_document, read_article,
@@ -148,7 +148,7 @@ class WorkflowTest(unittest.TestCase):
         self.write('entities/a.md', graph_page())
         self.write('entities/b.md', graph_page())
         self.assertEqual(current_summaries(self.root), {})
-        self.assertEqual(WikiRetriever(self.root).search('Shared history', layer='summaries'), [])
+        self.assertFalse(any(e.get('layer') == 'summaries' for e in WikiRetriever(self.root).tree()['entries']))
 
     def test_summary_limit_leaves_retryable_pending(self):
         self.graph()
@@ -199,15 +199,15 @@ class WorkflowTest(unittest.TestCase):
             self.assertEqual(stats['failed'], 2)
             self.assertIn('uncited input', stats['errors'][0]['error'])
 
-    def test_direct_knowledge_article_access_and_soft_tags(self):
+    def test_direct_knowledge_article_access_through_tree(self):
         text, _ = render_knowledge(self.root, self.proposal(), {'entities/alpha.md'})
         self.write('entities/alpha.md', text)
         self.write('sources/digests/old.md', '# Alpha\nUnverified old digest')
         self.write('sources/old.md', '# Alpha\nLegacy source summary')
         retriever = WikiRetriever(self.root)
-        hits = retriever.search('Alpha', layer='knowledge', tags=['missing-tag'])
-        self.assertEqual(hits[0].page.rel_path, 'entities/alpha.md')
-        self.assertTrue(retriever.search('Alpha', layer='articles'))
+        entries = retriever.tree(depth=3)['entries']
+        self.assertTrue(any(e['path'] == 'entities/alpha.md' for e in entries))
+        self.assertTrue(any(e.get('layer') == 'articles' for e in entries))
         self.assertFalse(any('digests' in p for p in retriever.pages))
         self.assertNotIn('sources/old.md', retriever.pages)
         self.assertEqual(retriever.read(['entities/alpha'])[0]['type'], 'file')
@@ -224,17 +224,55 @@ class WorkflowTest(unittest.TestCase):
                 {'id': name, 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(arguments)}}]}
         model = Mock(side_effect=[tool('wiki_read', {'paths': ['entities/alpha.md']}),
                                   tool('source_read', {'article': self.article['article'], 'start_line': 7, 'end_line': 8}),
-                                  {'role': 'assistant', 'content': 'done'}])
+                                  tool('finish_answer', {'answer': 'unknown', 'evidence_chain': [], 'requirements': []})])
         agent = WikiAgent(WikiRetriever(self.root), call_llm_with_tools=model, t_max=3)
         result = agent.retrieve('Where is the organization founded by Alpha?')
-        self.assertEqual(result.total_calls, 2)
+        self.assertEqual(result.total_calls, 3)
         self.assertEqual(len(result.evidence), 1)
         self.assertEqual(result.evidence[0]['quote'], 'Alpha founded Beta.\nBeta is in Paris.')
-        model = Mock(return_value=tool('wiki_search', {'query': 'Alpha'}))
+        model = Mock(return_value=tool('wiki_tree', {'path': '/'}))
         result = WikiAgent(WikiRetriever(self.root), call_llm_with_tools=model, t_max=1).retrieve('Alpha?')
         self.assertEqual(result.total_calls, 1)
         self.assertEqual(result.pages, [])  # no hidden auto-read beyond budget
         self.assertEqual(result.evidence, [])
+
+    def test_source_read_resolves_links_emitted_by_knowledge_pages(self):
+        retriever = WikiRetriever(self.root)
+        article = self.article['article']
+        for link in (article, article[:-3], citation_link({'article': article}),
+                     citation_link(self.citation), f' [[{article[:-3]}#L7-L7|Alpha]] '):
+            with self.subTest(link=link):
+                passage = json.loads(retriever.execute_tool('source_read', {
+                    'article': link, 'start_line': 7, 'end_line': 7}))
+                self.assertEqual(passage, self.citation)
+                self.assertEqual(retriever.read([link])[0]['path'], passage['article'])
+
+    def test_resolved_source_links_still_enforce_article_and_range_contracts(self):
+        retriever = WikiRetriever(self.root)
+        self.write('entities/alpha.md', '# Alpha\nNavigation only.\n')
+        for invalid in ('entities/alpha', '../secret', '/tmp/secret.md',
+                        'sources/articles/missing', None):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                retriever.source_read(invalid, 1, 1)
+        for start, end in ((0, 1), (8, 7), (1, 201), (1, 9), (True, 7)):
+            with self.subTest(start=start, end=end), self.assertRaises(ValueError):
+                retriever.source_read(self.article['article'][:-3], start, end)
+
+    def test_answer_normalizes_read_article_links_without_relaxing_quote_checks(self):
+        proposal = {'answer': 'Beta', 'evidence_chain': [
+            {'claim': 'Alpha founded Beta', 'citations': [dict(self.citation)]}]}
+        for link in (self.article['article'][:-3], citation_link(self.citation)):
+            with self.subTest(link=link):
+                proposal['evidence_chain'][0]['citations'][0]['article'] = link
+                accepted = validate_answer(proposal, [self.citation])
+                self.assertEqual(accepted['evidence_chain'][0]['citations'][0], self.citation)
+                self.assertEqual(proposal['evidence_chain'][0]['citations'][0]['article'], link)
+        proposal['evidence_chain'][0]['citations'][0]['quote'] = 'Alpha founded'
+        with self.assertRaisesRegex(ValueError, 'quote mismatch.*complete cited lines'):
+            validate_answer(proposal, [self.citation])
+        proposal['evidence_chain'][0]['citations'][0] = {**self.citation, 'end_line': 8}
+        with self.assertRaisesRegex(ValueError, 'unread line range'):
+            validate_answer(proposal, [self.citation])
 
     def test_bad_source_tool_returns_error_and_agent_can_recover(self):
         messages = []
@@ -268,12 +306,6 @@ class WorkflowTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_answer(proposal, [passage])
 
-    def test_no_article_evidence_means_unknown_without_answer_call(self):
-        with patch('run_qa.call_llm_json') as generate:
-            result = _answer('Question?', [])
-            self.assertEqual(result['prediction'], 'unknown')
-            generate.assert_not_called()
-
     def test_complete_build_summary_navigation_and_answer(self):
         first = self.proposal(related=[{'path': 'entities/beta.md', 'reason': 'founded by Alpha'}])
         second = self.proposal('entities/beta.md', [{'path': 'entities/alpha.md', 'reason': 'founder'}])
@@ -288,25 +320,25 @@ class WorkflowTest(unittest.TestCase):
                 stats = bench_ingest.ingest_batch([self.raw])
         self.assertEqual(stats['summaries']['built'], 1)
         retriever = WikiRetriever(self.root)
-        summary = retriever.search('Alpha', layer='summaries')[0].page.rel_path
+        summary = next(e['path'] for e in retriever.tree()['entries'] if e.get('layer') == 'summaries')
         steps = [('wiki_read', {'paths': [summary]}),
                  ('wiki_read', {'paths': ['entities/alpha.md', 'entities/beta.md']}),
                  ('source_read', {'article': self.article['article'], 'start_line': 7, 'end_line': 8})]
         replies = [{'role': 'assistant', 'content': None, 'tool_calls': [
             {'id': str(i), 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(args)}}]}
                    for i, (name, args) in enumerate(steps)]
-        replies.append({'role': 'assistant', 'content': 'done'})
+        citations = second['facts'][0]['citations']
+        proposal = {'answer': 'Paris', 'requirements': [
+            {'id': 'location', 'question': 'Where is Beta?', 'status': 'supported', 'citations': citations}],
+            'evidence_chain': [{'requirement_id': 'location', 'claim': 'Beta is in Paris', 'citations': citations}]}
+        replies.append({'role': 'assistant', 'content': None, 'tool_calls': [
+            {'id': 'finish', 'type': 'function', 'function': {
+                'name': 'finish_answer', 'arguments': json.dumps(proposal)}}]})
         result = WikiAgent(retriever, call_llm_with_tools=Mock(side_effect=replies), t_max=4).retrieve('Where is Beta?')
-        answer_proposal = {'answer': 'Paris', 'evidence_chain': [
-            {'claim': 'Beta is in Paris', 'citations': second['facts'][0]['citations']}]}
-        with patch('run_qa.call_llm_json', return_value=answer_proposal) as answer_llm:
-            answer = _answer('Where is Beta?', result.evidence)
-            supplied = json.loads(answer_llm.call_args.kwargs['user_prompt'])
-        self.assertEqual(answer['prediction'], 'Paris')
-        self.assertEqual(supplied['article_passages'], result.evidence)
-        self.assertNotIn('summary', supplied)
+        self.assertEqual(result.answer['prediction'], 'Paris')
+        self.assertEqual(result.stop_reason, 'submitted')
         self.assertEqual(len(result.evidence), 1)
-        self.assertEqual(result.total_calls, 3)
+        self.assertEqual(result.total_calls, 4)
 
     def test_unread_page_cannot_be_overwritten(self):
         before = graph_page()

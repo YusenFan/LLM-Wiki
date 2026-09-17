@@ -1,23 +1,19 @@
-"""Search Wiki navigation pages and read exact article evidence.
+"""Navigate the Wiki directory tree and read exact article evidence.
 
-wiki_search returns metadata with optional layer and tag preferences.
-wiki_read opens knowledge/summary pages; source_read returns article ranges.
-The existing structured-field and BM25 scoring are retained.
+wiki_tree lists readable paths without ranking. wiki_read opens navigation
+pages, and source_read returns exact article ranges. No search scoring is used.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import math
 import re
-from collections import Counter
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Iterable
+from pathlib import Path, PurePosixPath
 
 from build_summaries import current_summaries
-from wiki_documents import ARTICLE_PREFIX, parse_document, read_article, wiki_path
+from wiki_documents import ARTICLE_PREFIX, parse_document, read_article, resolve_wiki_link, wiki_path
 
 _logger = logging.getLogger("llm_wiki.retriever")
 
@@ -27,7 +23,7 @@ _logger = logging.getLogger("llm_wiki.retriever")
 @dataclass
 class WikiPage:
     """A single compiled Wiki page."""
-    name: str                                        # file stem (no .md)
+    name: str                                        # readable title (filename is a fallback)
     dir_name: str                                    # directory under wiki/
     rel_path: str                                    # e.g. "entities/Einstein.md"
     text: str                                        # full markdown (with frontmatter)
@@ -44,37 +40,16 @@ class WikiPage:
         return "summaries" if self.dir_name == "summaries" else "knowledge"
 
 
-@dataclass
-class SearchResult:
-    page: WikiPage
-    score: float
-    matched_fields: list[str] = field(default_factory=list)
-
-
 # ─── Retriever ────────────────────────────────────────────────────────────
 
 class WikiRetriever:
-    """Loads a compiled Wiki and exposes `search` / `read` tools."""
-
-    # BM25 hyper-parameters
-    _BM25_K1 = 1.2
-    _BM25_B = 0.75
-    _BM25_WEIGHT = 5.0   # scale factor on the BM25 score before adding
-    _BM25_CAP = 60.0     # cap on the BM25 contribution (< exact-name score 100)
-
-    _TOKEN_RE = re.compile(r"[a-z0-9]+")
+    """Expose directory traversal and explicit page/article reads."""
 
     def __init__(self, wiki_dir: Path):
         self.wiki_dir = Path(wiki_dir)
         self.pages: dict[str, WikiPage] = {}
         self.dir_indexes: dict[str, str] = {}        # dir_name → _index.md content
         self._loaded = False
-
-        # BM25 inverted index
-        self._inv: dict[str, dict[str, int]] = {}     # token → {rel_path: tf}
-        self._doc_len: dict[str, int] = {}            # rel_path → doc length
-        self._avg_dl: float = 0.0
-        self._idf: dict[str, float] = {}
 
     # ── loading ───────────────────────────────────────────────────────────
 
@@ -126,7 +101,6 @@ class WikiRetriever:
             page = self._parse_page(md.stem, rel, text)
             self.pages[rel_str] = page
 
-        self._build_bm25()
         self._loaded = True
         _logger.info(
             "loaded wiki: %d pages, %d directory indices",
@@ -142,8 +116,10 @@ class WikiRetriever:
         aliases = [a for a in aliases if isinstance(a, str)] if isinstance(aliases, list) else []
         tags = [t for t in tags if isinstance(t, str)] if isinstance(tags, list) else []
         description = ""
-        if str(rel).startswith(ARTICLE_PREFIX):
-            stem = str(metadata.get("title") or metadata.get("source_title") or stem)
+        heading = next((line[2:].strip() for line in body.splitlines() if line.startswith("# ")), "")
+        stem = str(metadata.get("title") or metadata.get("source_title") or heading or stem)
+        if re.fullmatch(r"[0-9a-f]{64}", stem):
+            stem = "Untitled page"
 
         for line in body.strip().split("\n"):
             line = line.strip()
@@ -165,149 +141,45 @@ class WikiRetriever:
             links_to=links_to,
         )
 
-    # ── BM25 ──────────────────────────────────────────────────────────────
+    # ── directory tree ────────────────────────────────────────────────────
 
-    @classmethod
-    def _tokenize(cls, text: str) -> list[str]:
-        """ASCII tokenizer (lowercase, ≥2 chars). Suitable for English corpora."""
-        return [m.group() for m in cls._TOKEN_RE.finditer(text.lower()) if len(m.group()) >= 2]
-
-    def _build_bm25(self) -> None:
-        inv: dict[str, dict[str, int]] = {}
-        doc_len: dict[str, int] = {}
-        total = 0
-        for rp, page in self.pages.items():
-            doc_text = f"{page.name.replace('-', ' ')} {page.description} {page.body}"
-            toks = self._tokenize(doc_text)
-            doc_len[rp] = len(toks)
-            total += len(toks)
-            for tok, tf in Counter(toks).items():
-                inv.setdefault(tok, {})[rp] = tf
-        self._inv = inv
-        self._doc_len = doc_len
-        self._avg_dl = total / len(self.pages) if self.pages else 1.0
-        N = len(self.pages)
-        self._idf = {
-            tok: math.log((N - len(post) + 0.5) / (len(post) + 0.5) + 1.0)
-            for tok, post in inv.items()
-        }
-
-    def _bm25_score(self, query_tokens: Iterable[str]) -> dict[str, float]:
-        scores: dict[str, float] = {}
-        k1, b, avgdl = self._BM25_K1, self._BM25_B, self._avg_dl
-        for tok in query_tokens:
-            idf = self._idf.get(tok, 0.0)
-            if idf <= 0:
-                continue
-            postings = self._inv.get(tok)
-            if not postings:
-                continue
-            for rp, tf in postings.items():
-                dl = self._doc_len.get(rp, 0)
-                num = tf * (k1 + 1)
-                den = tf + k1 * (1 - b + b * dl / avgdl)
-                scores[rp] = scores.get(rp, 0.0) + idf * num / den
-        return scores
-
-    # ── search ────────────────────────────────────────────────────────────
-
-    def search(self, query: str, limit: int = 10, layer: str = "all",
-               tags: list[str] | None = None) -> list[SearchResult]:
-        """Search by structured fields first, then fall back to page content (BM25)."""
+    def tree(self, path: str = "/", depth: int = 2, offset: int = 0, limit: int = 100) -> dict:
+        """List QA-visible paths without ranking; directories can be expanded and paginated."""
         self.load()
-        if layer not in {"all", "summaries", "knowledge", "articles"}:
-            raise ValueError("unknown search layer")
-        if tags is not None and (not isinstance(tags, list) or any(not isinstance(t, str) for t in tags)):
-            raise ValueError("tags must be a list of strings")
-        query = (query or "").strip()
-        if not query:
-            return []
-
-        sub_words = [w for w in query.split() if w]
-        bm25 = self._bm25_score(self._tokenize(query))
-
-        results: list[SearchResult] = []
-        scored_paths: set[str] = set()
-
-        for rp, page in self.pages.items():
-            if layer != "all" and page.layer != layer:
-                continue
-            total = 0.0
-            matched: set[str] = set()
-            for w in sub_words:
-                s, fields = self._score_word(w, page)
-                if s > 0:
-                    total += s
-                    matched.update(fields)
-
-            bm25_s = bm25.get(rp, 0.0)
-            if bm25_s > 0:
-                total += min(bm25_s * self._BM25_WEIGHT, self._BM25_CAP)
-                matched.add("content")
-
-            # Tags add a preference; missing tags never exclude a text match.
-            if tags and {t.casefold() for t in tags} & {t.casefold() for t in page.tags}:
-                total += 50.0
-                matched.add("requested_tags")
-
-            if total > 0:
-                results.append(SearchResult(page=page, score=total, matched_fields=sorted(matched)))
-                scored_paths.add(rp)
-
-        # BM25-only hits (no structured match)
-        for rp, bm25_s in bm25.items():
-            if rp in scored_paths or bm25_s <= 0:
-                continue
-            page = self.pages.get(rp)
-            if page is None:
-                continue
-            if layer != "all" and page.layer != layer:
-                continue
-            results.append(SearchResult(
-                page=page,
-                score=min(bm25_s * self._BM25_WEIGHT, self._BM25_CAP),
-                matched_fields=["content"],
-            ))
-
-        results.sort(key=lambda r: r.score, reverse=True)
-        return results[:max(0, limit)]
-
-    @staticmethod
-    def _score_word(word: str, page: WikiPage) -> tuple[float, set[str]]:
-        """Score a single sub-token against one page (highest field wins)."""
-        w = word.lower()
-        best_score = 0.0
-        best_field: str | None = None
-
-        # name
-        name = page.name.lower()
-        name_norm = name.replace("-", " ")
-        if w == name or w == name_norm:
-            best_score, best_field = 100.0, "name"
-        elif w in name or w in name_norm:
-            best_score, best_field = 80.0, "name"
-
-        # aliases
-        for alias in page.aliases:
-            al = alias.lower()
-            if w == al and 90.0 > best_score:
-                best_score, best_field = 90.0, "aliases"
-                break
-            if w in al and 70.0 > best_score:
-                best_score, best_field = 70.0, "aliases"
-
-        # tags
-        for tag in page.tags:
-            tl = tag.lower()
-            if (w == tl or w in tl) and 50.0 > best_score:
-                best_score, best_field = 50.0, "tags"
-                break
-
-        # description
-        if page.description and w in page.description.lower() and 40.0 > best_score:
-            best_score, best_field = 40.0, "description"
-
-        return best_score, ({best_field} if best_field else set())
+        if not isinstance(path, str):
+            raise ValueError("path must be a wiki-relative directory")
+        path = path.strip()
+        if path == "/":
+            path = ""
+        if path and ("\\" in path or PurePosixPath(path).is_absolute()
+                     or ".." in PurePosixPath(path).parts or PurePosixPath(path).as_posix() != path):
+            raise ValueError("path must be a wiki-relative directory, or /")
+        if type(depth) is not int or not 1 <= depth <= 10:
+            raise ValueError("depth must be between 1 and 10")
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("offset must be nonnegative and limit must be between 1 and 200")
+        entries = {}
+        for page in self.pages.values():
+            entries[page.rel_path] = {"path": page.rel_path, "type": "file", "title": page.name,
+                                     "layer": page.layer}
+        for directory in self.dir_indexes:
+            index_path = f"{directory}/_index.md"
+            entries[index_path] = {"path": index_path, "type": "file", "title": f"{directory} index",
+                                   "layer": "index"}
+        for file_path in list(entries):
+            for parent in PurePosixPath(file_path).parents:
+                if str(parent) != ".":
+                    entries.setdefault(str(parent), {"path": str(parent), "type": "directory"})
+        if path and (path not in entries or entries[path]["type"] != "directory"):
+            raise ValueError("directory not found; use wiki_tree('/') to list available paths")
+        prefix = path + "/" if path else ""
+        visible = [item for name, item in sorted(entries.items())
+                   if name.startswith(prefix) and name != path
+                   and len(name[len(prefix):].split("/")) <= depth]
+        selected = visible[offset:offset + limit]
+        next_offset = offset + len(selected)
+        return {"path": path or "/", "depth": depth, "entries": selected, "total": len(visible),
+                "next_offset": next_offset if next_offset < len(visible) else None}
 
     # ── read ──────────────────────────────────────────────────────────────
 
@@ -321,10 +193,7 @@ class WikiRetriever:
         self.load()
         out: list[dict] = []
         for raw in paths:
-            p = (raw or "").strip().removeprefix("[[").removesuffix("]]")
-            p = p.split("|", 1)[0].split("#", 1)[0]
-            if p + ".md" in self.pages:
-                p += ".md"
+            p = resolve_wiki_link(raw, self.pages)
             if p == "/":
                 out.append({"path": "/", "type": "root", "dirs": sorted(self.dir_indexes.keys())})
                 continue
@@ -375,8 +244,10 @@ class WikiRetriever:
     def source_read(self, article: str, start_line: int = 1, end_line: int | None = None) -> dict:
         """Read bounded article passages and retain the version observed by the agent."""
         self.load()
+        article = resolve_wiki_link(article, self.pages)
         if article not in self.pages or self.pages[article].layer != "articles":
-            raise ValueError("article not found")
+            raise ValueError(f"article not found: {article!r}; use a sources/articles/ path from "
+                             "a knowledge-page link or wiki_tree(path='sources/articles')")
         if type(start_line) is not int:
             raise ValueError("start_line must be an integer")
         total = len(self.pages[article].text.splitlines())
@@ -387,54 +258,27 @@ class WikiRetriever:
         return read_article(self.wiki_dir, article, start_line, end_line)
 
     def wiki_map(self) -> str:
-        """A short, agent-facing overview of the Wiki layout."""
-        self.load()
-        counts: dict[str, int] = {}
-        for page in self.pages.values():
-            counts[page.dir_name] = counts.get(page.dir_name, 0) + 1
-        lines = ["# Wiki Map\n"]
-        for d in sorted(counts):
-            lines.append(f"- **{d or '/'}/** ({counts[d]} pages)")
-            idx = self.dir_indexes.get(d, "")
-            if idx:
-                entries = re.findall(r"\[\[(.+?)\]\]", idx)
-                for e in entries[:5]:
-                    lines.append(f"  - {e}")
-                if len(entries) > 5:
-                    lines.append(f"  - ... ({len(entries) - 5} more)")
+        """Seed the agent with an unranked directory tree, with explicit expansion guidance."""
+        listing = self.tree(depth=2, limit=200)
+        lines = ["# Wiki directory tree", "Files are navigation entries, not evidence.",
+                 "Use wiki_tree(path, depth, offset) to expand directories or continue a listing."]
+        for entry in listing["entries"]:
+            indent = "  " * (len(entry["path"].split("/")) - 1)
+            if entry["type"] == "directory":
+                lines.append(f"{indent}- {entry['path']}/")
+            else:
+                lines.append(f"{indent}- {entry['path']} — {entry['title']}")
+        if listing["next_offset"] is not None:
+            lines.append(f"More entries: wiki_tree(path='/', depth=2, offset={listing['next_offset']})")
         return "\n".join(lines)
 
     # ── tool dispatch (matches paper tool names) ──────────────────────────
 
     def execute_tool(self, name: str, arguments: dict) -> str:
         """Run a single tool call and return a JSON string."""
-        if name == "wiki_search":
-            results = self.search(
-                arguments.get("query", ""),
-                limit=min(int(arguments.get("limit", 10)), 50),
-                layer=arguments.get("layer", "all"),
-                tags=arguments.get("tags"),
-            )
-            payload = {
-                "matched": len(results),
-                "results": [
-                    {
-                        "path": r.page.rel_path,
-                        "name": r.page.name,
-                        "score": round(r.score, 3),
-                        "matched_fields": r.matched_fields,
-                        "meta": {
-                            "aliases": r.page.aliases,
-                            "tags": r.page.tags,
-                            "description": r.page.description,
-                            "layer": r.page.layer,
-                        },
-                    }
-                    for r in results
-                ],
-            }
-            return json.dumps(payload, ensure_ascii=False)
-
+        if name == "wiki_tree":
+            return json.dumps(self.tree(arguments.get("path", "/"), arguments.get("depth", 2),
+                                        arguments.get("offset", 0), arguments.get("limit", 100)), ensure_ascii=False)
         if name == "wiki_read":
             return json.dumps(self.read(arguments.get("paths") or arguments.get("dirs") or []),
                               ensure_ascii=False)
@@ -453,23 +297,16 @@ WIKI_TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
         "function": {
-            "name": "wiki_search",
-            "description": (
-                "Search the Wiki index by prioritizing structured signals such as page "
-                "names, aliases, tags, and descriptions before falling back to page "
-                "content. Returns candidate pages and metadata only (no body text)."
-            ),
+            "name": "wiki_tree",
+            "description": "List the Wiki directory tree without relevance scoring. Choose files by title and path, expand a subdirectory, or use next_offset to see more entries. Lists current readable pages only; no content is read.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Search query."},
-                    "limit": {"type": "integer", "description": "Max results to return (default 10)."},
-                    "layer": {"type": "string", "enum": ["all", "summaries", "knowledge", "articles"],
-                              "description": "Prefer summaries for navigation; all preserves direct access."},
-                    "tags": {"type": "array", "items": {"type": "string"},
-                             "description": "Optional ranking preference, never a hard filter."},
+                    "path": {"type": "string", "description": "Wiki-relative directory such as film or sources/articles; default /"},
+                    "depth": {"type": "integer", "description": "Levels below path, 1-10; default 2"},
+                    "offset": {"type": "integer", "description": "Pagination offset, default 0"},
+                    "limit": {"type": "integer", "description": "Max entries, 1-200; default 100"},
                 },
-                "required": ["query"],
             },
         },
     },

@@ -14,7 +14,9 @@ summaries/ (navigation, tags, member knowledge pages)
   The filename is the full content hash; changed text creates a different file.
 - Knowledge directories declared in `page_types.yaml`: e.g. `entities/`,
   `concepts/`, `events/`, `relations/`.
-- `summaries/<member-set-hash>.md`: one level of high-level navigation summaries.
+- `summaries/<readable-title>.md`: one level of high-level navigation summaries.
+  Duplicate titles use numeric suffixes; membership and freshness are checked
+  from frontmatter, not filenames.
 - `_index.md` files and root `index.md`: deterministic navigation lists.
 
 `sources`, `summaries`, and `syntheses` are reserved names. No new digest pages
@@ -79,6 +81,7 @@ is not sufficient to remove another group.
 ---
 type: summary
 schema: related-summary-v1
+title: Alpha and Beta
 tags: [history, organizations]
 members: [entities/alpha.md, entities/beta.md]
 fingerprint: <hash of member paths and current content>
@@ -105,16 +108,19 @@ and regenerated summary indexes.
 
 ## QA contract
 
-- `wiki_search(query, layer?, tags?)` supports `all`, `summaries`, `knowledge`,
-  and `articles`; tags are a ranking preference, never an exclusion rule.
+- `wiki_tree(path?, depth?, offset?, limit?)` lists unranked directories and files
+  with readable titles. Expand a subdirectory or continue with `next_offset`.
+  No BM25 or custom relevance scoring is used.
 - `wiki_read(paths)` opens navigation pages. For an article it returns the path
   and line count, prompting `source_read` rather than treating navigation as proof.
 - `source_read(article, start_line, end_line)` returns actual article lines and
   the version read. A call reads up to 200 lines, with an 80-line default window.
-- The answer step receives only article passages actually read. It returns a
-  short answer plus `evidence_chain`, with cited passages for each factual hop.
+- The same agent maintains evidence requirements and submits a short answer
+  through `finish_answer`, with an `evidence_chain` citing actual article reads.
+  Navigation content in the conversation is not final proof.
 - Python verifies that citations lie inside read passages with matching versions
-  and exact quotes. Missing or invalid evidence produces `unknown`.
+  and exact quotes. Invalid submissions return a tool error for correction within
+  budget; failure to submit a validated answer leaves `unknown`.
 
 Valid ranges and exact quotes establish provenance. They do **not** establish
 that the source entails the claim, or that the model listed every necessary hop.
