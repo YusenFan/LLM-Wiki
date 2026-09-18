@@ -1,221 +1,385 @@
-# Retrieval as Reasoning: Self-Evolving Agent-Native Retrieval via LLM-Wiki
+# LLM-Wiki
 
-**Haoliang Ming, Feifei Li, Xiaoqing Wu, Wenhui Que**
+LLM-Wiki turns documents into a persistent, linked knowledge base and answers
+questions using evidence read from that knowledge base. It separates **offline
+knowledge construction** from **online question answering**: articles are archived,
+facts accumulate on knowledge pages, and summaries help a single QA agent find the
+pages it needs.
 
-This repository is based on the official code release for **LLM-Wiki**, an
-agent-native retrieval system that operationalizes the
-_Retrieval-as-Reasoning_ paradigm. LLM-Wiki compiles documents into
-structured Wiki pages. This local refactor exposes `summary_search`, `wiki_tree`, `wiki_read`
-and `source_read` through tool-calling interfaces, with knowledge-page or original-article citations
-and related-page summaries. The original Error Book module is retained but is
-not invoked by the new ingestion pipeline. Offline Wiki compilation and online
-retrieval / question answering / evaluation remain separate stages.
+The model proposes facts, relationships, and answers. Python manages storage,
+preserves earlier knowledge, builds navigation groups, and validates citations
+against the text actually delivered to the agent.
 
-> **Paper (arXiv):** https://arxiv.org/abs/2605.25480
+## Architecture
 
----
-
-## Repository layout
-
-```
-release/
-├── README.md
-├── LICENSE
-├── requirements.txt
-├── arxiv.txt
-├── configs/
-│   ├── page_types.yaml       # default page-type catalog
-│   ├── purpose_bench.md      # default purpose template
-│   └── wiki-schema.md        # wiki schema specification
-├── llm_wiki_bench/
-│   ├── __init__.py
-│   ├── bench_config.py       # dataset paths, LLM config, wiki directory management
-│   ├── llm_client.py         # OpenAI-compatible API client (chat + tool calls)
-│   ├── download_datasets.py  # download public dev sets
-│   ├── preprocess_bench.py   # raw paragraphs → Markdown articles
-│   ├── bench_ingest.py       # two-step LLM ingestion engine
-│   ├── wiki_documents.py    # article archive, citation checks, page rendering
-│   ├── build_summaries.py   # related-page grouping + summary generation
-│   ├── bench_error_book.py   # retained legacy error-book module
-│   ├── run.py                # offline wiki construction runner
-│   ├── summary_retrieval.py  # summary BM25 + dense + RRF
-│   ├── embedding_client.py   # cached OpenAI-compatible embeddings
-│   ├── token_budget.py       # token-bounded navigation payloads
-│   ├── wiki_retriever.py     # summary_search + tree + page/article tools
-│   ├── wiki_agent.py         # Retrieval-as-Reasoning tool-calling agent
-│   ├── run_qa.py             # end-to-end retrieval + answer runner
-│   └── evaluate.py           # EM / F1 evaluation
-└── examples/
-    └── run_hotpotqa.sh       # minimal reproduction example
+```mermaid
+flowchart TD
+    subgraph Build[Offline knowledge construction]
+        Input[Documents or dataset context paragraphs] --> Articles[Immutable article archive]
+        Articles --> Proposals[LLM page selection and fact proposals]
+        Existing[Existing pages and their source articles] --> Proposals
+        Proposals --> Validate[Python validation and incremental merge]
+        Validate --> Knowledge[Knowledge pages with facts and source links]
+        Knowledge --> Groups[Python groups explicit Related Pages]
+        Groups --> Summaries[LLM group summaries or Python singleton summaries]
+    end
+    subgraph QA[Online question answering]
+        Question[Question] --> Search[Summary BM25 and dense search with RRF]
+        Search --> Agent[Single QA agent]
+        Agent --> Read[Read knowledge pages or optional article passages]
+        Read --> Evidence[Question-local evidence IDs and snapshots]
+        Evidence --> Agent
+        Agent --> Submit[Submit answer and selected evidence IDs]
+        Submit --> Check[Python citation and requirement checks]
+        Check -->|Rejected within budget| Agent
+        Check -->|Accepted| Answer[Answer with citations or explicit unknown]
+    end
+    Summaries --> Search
+    Knowledge --> Read
+    Articles --> Read
 ```
 
-## Requirements
+### Three document layers
+
+| Layer           | Contents                                                                                                                                         | Role in QA                                                                             |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------- |
+| Articles        | Byte-for-byte copies of processed Markdown articles under `sources/articles/<sha256>.md`. Changed content has a different hash and archive path. | Optional source passages for additional detail, ambiguity, conflicts, or verification. |
+| Knowledge pages | Entity, concept, event, or other configured pages containing facts, article links, explained relationships, and update records.                  | Read facts can directly support an answer.                                             |
+| Summaries       | One level of navigation summaries with explicit member-page links and content fingerprints.                                                      | Retrieval entry points; summaries cannot serve as final answer evidence.               |
+
+The Wiki uses Markdown and YAML frontmatter on disk. Summary embeddings are
+cached in SQLite and searched locally; no vector database is required.
+
+## How the system works
+
+### 1. Prepare and archive articles
+
+Dataset preprocessing writes Markdown articles and a separate `qa_pairs.jsonl`.
+For HotpotQA, it extracts all context paragraphs, including distractors, and
+deduplicates exact **title and paragraph-text pairs**. Gold answers and supporting
+titles are stored with the QA records; they do not select the ingestion articles.
+An archived HotpotQA article is a processed dataset paragraph, not a full
+Wikipedia page.
+
+Wiki initialization creates the configured page-type directories and retains
+generic `entities` and `concepts` categories. First-time purpose and page-type
+initialization can call the LLM, with fallback configuration if initialization
+fails. It does not create factual knowledge pages.
+
+### 2. Compile facts into knowledge pages
+
+For each article batch, `bench_ingest.ingest_batch()`:
+
+1. Checks content hashes and successful build receipts to skip reusable articles.
+2. Archives the input articles. If knowledge pages already exist, a selection
+   model chooses up to 15 existing pages to read for updates or relationships.
+   An empty Wiki skips this selection step.
+3. Gives the generation model the input articles, selected page contents, their
+   existing source articles, fact IDs, and allowed page types.
+4. Receives a JSON proposal containing page paths, facts with article references,
+   and Related Pages links with explanations.
+5. Validates paths, article hashes, references, update records, and citation
+   coverage for every input article before writing knowledge pages.
+6. Renders Markdown, records successful articles, and rebuilds navigation indexes.
+
+Each fact must reference at least one supplied article. At construction time,
+the model supplies article paths; it does not copy exact quotations or calculate
+line ranges. Article-reference validation establishes the source location, while
+the model remains responsible for extracting facts supported by that source.
+
+Rejected proposals receive validation feedback for up to two corrective retries.
+If a multi-article proposal still fails validation, ingestion retries each article
+individually against the latest Wiki. Unresolved failures remain retryable and
+write diagnostics to `.build/failures/`.
+
+### 3. Preserve knowledge as new articles arrive
+
+Updates add information to the same page while preserving earlier facts, source
+links, relationships, and metadata. Aliases and tags are combined. Each new fact
+on an existing page includes a change record:
+
+- `relation`: `addition`, `elaboration`, `temporal_update`, `correction`, or `conflict`.
+- `reason`: why the new statement adds to or differs from existing knowledge.
+- `related_fact_ids`: earlier facts on that page; required for non-addition changes.
+- `valid_at`: a time explicitly supported by the source, or `null`.
+
+For example, adding “Alpha moved to Berlin in 2010” preserves an earlier fact that
+Alpha lived in Paris in 2000. The new fact can link to the earlier fact as a
+`temporal_update`. Corrections and conflicts also retain the earlier statement
+and add an explanation. QA must use the dates and conditions relevant to the
+question.
+
+### 4. Build summary navigation
+
+After ingestion, Python forms each candidate group from a knowledge page plus
+its explicit Related Pages targets. It deduplicates identical groups and removes
+strict subsets of another group. Overlapping groups remain separate; they are
+not merged into connected components.
+
+For example, `{A, B, C}` and `{A, B, D}` both remain, while `{A, B}` is removed.
+An isolated page remains a singleton group.
+
+For groups with multiple pages, the LLM writes a title, description, tags, and
+overview. Python creates singleton summaries directly from their member page
+without a model call. Python owns group membership and member links in both cases.
+
+Each summary stores a fingerprint of its members and their content. Retrieval
+excludes summaries whose groups or member content have changed. Rebuild summaries
+after updating knowledge pages, then start a new QA process to load the new
+snapshot. Complete coverage requires a successful build of all groups; check
+`covered_pages` and `uncovered_pages` in the summary report.
+
+### 5. Retrieve, read, and answer in one agent loop
+
+`run_qa` loads a Wiki snapshot and starts one `WikiAgent` conversation per question.
+Its initial navigation retrieves current summaries using BM25 and dense
+embeddings, then combines their ranks with reciprocal rank fusion (RRF).
+Only summaries enter this search index. Knowledge pages and articles are reached
+through page links, known paths, or directory browsing.
+
+The agent identifies the facts needed for each entity or reasoning hop, reads
+relevant pages, and records requirements as `unresolved` or `supported`. It can
+search again with a newly discovered entity or browse the Wiki tree when the
+initial summaries do not cover the question.
+
+| Tool                    | Purpose                                                                                  |
+| ----------------------- | ---------------------------------------------------------------------------------------- |
+| `summary_search`        | Search summaries again, page through candidates, or exclude already seen summaries.      |
+| `wiki_tree`             | Browse directories and files with readable titles.                                       |
+| `wiki_read`             | Read selected summaries or knowledge pages; continue truncated text using `next_offset`. |
+| `source_read`           | Read exact archived article lines when more detail or verification is needed.            |
+| `update_evidence_state` | Record or update evidence requirements using IDs from actual reads.                      |
+| `finish_answer`         | Submit a short answer, requirements, and an evidence chain, or submit `unknown`.         |
+
+Knowledge-page facts can support answers directly. Reading original articles is
+optional. The agent is instructed to answer from read evidence and to return
+`unknown` when it cannot obtain sufficient evidence.
+
+### 6. Generate citations from evidence snapshots
+
+Actual knowledge-page and article reads return evidence IDs. The agent stores
+these in a registry scoped to the current question and selects IDs when marking
+requirements supported or submitting answer hops. Python resolves the selected
+IDs into exact citations:
+
+- Knowledge pages: `{page, page_version, start_offset, end_offset, quote}`.
+- Articles: `{article, version, start_line, end_line, quote}`.
+
+The model supplies claims and evidence IDs; Python supplies quotation text and
+coordinates. Unknown IDs, unread text, and citations outside delivered excerpts
+are rejected. Summary text, directory listings, and relationship descriptions
+do not provide answer evidence IDs. Invalid submissions return errors to the
+same agent so it can correct them within the remaining budget.
+
+These checks verify provenance and coverage of the recorded requirements. They
+do not prove that a quoted fact entails a claim, that the model identified every
+necessary hop, or that the answer is correct.
+
+## Setup
+
+Use Python 3.10 or later and run commands from the repository root:
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
+
+export OPENAI_API_KEY="your-api-key"
+export OPENAI_BASE_URL="https://api.openai.com/v1"
+export LLM_FAST_MODEL="gpt-4o-mini"
+export LLM_PREMIUM_MODEL="gpt-4o"
+export EMBEDDING_MODEL="text-embedding-3-small"
 ```
 
-Python ≥ 3.10. The code calls any **OpenAI-compatible** chat-completion API
-(OpenAI, Azure OpenAI, vLLM, Ollama, etc.) over HTTP.
+The client uses an OpenAI-compatible HTTP API. The fast model selects existing
+pages during ingestion; the premium model generates knowledge pages and multi-page
+summaries and is the default for the entire QA loop. QA requires tool calling.
+The model names above are the defaults in the code and can be overridden for
+your endpoint.
 
-## Configure the LLM backend
+If your settings are already in a local `.env`, load them before running Python;
+the application reads environment variables and does not automatically load the file:
 
 ```bash
-export OPENAI_API_KEY="sk-..."
-export OPENAI_BASE_URL="https://api.openai.com/v1"   # or your local server
-
-# Models used by the pipeline (override as needed):
-export LLM_PREMIUM_MODEL="gpt-4o"       # strong model — synthesis steps
-export LLM_FAST_MODEL="gpt-4o-mini"     # fast model  — analysis steps
+source .venv/bin/activate
+set -a
+source .env
+set +a
 ```
 
-## Quickstart: build a wiki on HotpotQA
+Embeddings use the chat endpoint and credentials by default. For a separate
+embedding service, set both `EMBEDDING_BASE_URL` and `EMBEDDING_API_KEY`.
+
+## Build and query a Wiki
+
+### HotpotQA quickstart
+
+Build from the first 10 questions' context paragraphs, then answer those questions:
 
 ```bash
-# Full pipeline (download → preprocess → ingest)
-python -m llm_wiki_bench.run --dataset hotpotqa --limit 500
+python -m llm_wiki_bench.run \
+  --dataset hotpotqa --limit 10 --batch-size 3 \
+  --wiki-dir wiki_output/hotpotqa/demo/wiki
 
-# Or run each stage separately:
+python -m llm_wiki_bench.run_qa \
+  --dataset hotpotqa --limit 10 \
+  --wiki-dir wiki_output/hotpotqa/demo/wiki \
+  --output results/hotpotqa/demo-predictions.jsonl \
+  --evaluate --verbose
+```
+
+The build downloads the dataset, preprocesses articles and QA records, ingests
+articles, and builds summaries. Construction and QA make model API calls; hybrid
+retrieval also calls the embedding API for uncached text.
+
+`run --limit` limits preprocessed questions, `bench_ingest --limit` limits articles,
+and `run_qa --limit` limits answered questions. The normal build reads all files
+in `raw/<dataset>/articles/`, including any left from earlier preprocessing runs.
+`--wiki-dir` isolates Wiki output and its ingestion cache; it does not isolate
+the shared raw articles or `data/<dataset>/qa_pairs.jsonl`.
+
+For builds isolated by question context, the repository also provides
+`build_test_one.py`, `build_test_ten.py`, and `build_test_hundred.py`. Their QA
+records are stored within their run directories. The current `run_qa` CLI still
+reads the shared `data/<dataset>/qa_pairs.jsonl`, so ensure it contains the matching
+questions before evaluating an isolated build.
+
+### Run individual stages
+
+```bash
 python -m llm_wiki_bench.run --dataset hotpotqa --only-download
-python -m llm_wiki_bench.run --dataset hotpotqa --only-preprocess --limit 500
-python -m llm_wiki_bench.run --dataset hotpotqa --only-ingest
-```
+python -m llm_wiki_bench.run --dataset hotpotqa --only-preprocess --limit 10
+python -m llm_wiki_bench.bench_ingest \
+  --dataset hotpotqa --wiki-dir wiki_output/hotpotqa/demo/wiki
 
-The compiled wiki is written to `wiki_output/<dataset>/wiki/`.
-
-## Run retrieval & answer evaluation
-
-Once a wiki has been compiled, the agent can traverse it to answer questions.
-The agent starts with a token-bounded batch of current summaries, retrieved using
-BM25 and dense embeddings with reciprocal rank fusion (RRF). It can requery
-`summary_search` for missing evidence, choose files with `wiki_tree` and `wiki_read`, follow wikilinks,
-and answers directly from sufficient knowledge-page facts. Original article reads are optional
-for missing details, ambiguity, conflicts, or explicit verification requests.
-`update_evidence_state` records unresolved/supported requirements; `finish_answer`
-submits an answer with `evidence_ids` selected from actual read results. Python generates exact
-knowledge-page or article citations from the registered snapshots. Rejected submissions return tool
-errors so the agent can correct them or retrieve more evidence within budget.
-See [summary hybrid retrieval](docs/summary-hybrid-retrieval.md) for configuration, caching and budgets,
-[the unified QA loop](docs/qa-agent-loop.md) for state and stopping rules,
-and [directory navigation](docs/wiki-tree-navigation.md) for tools and filename migration.
-
-The current local refactor uses **article → cited knowledge page → high-level
-summary**. It replaces digest generation and its automatic repair pipeline. Article generation retries
-rejected proposals with validation feedback up to twice, then retries failed
-multi-article batches one article at a time. Every attempt must pass the same
-citation and path checks before any knowledge page is written. Reports count
-only unresolved articles as failed; recovered batch failures appear as warnings
-with diagnostic files containing the rejected attempts. Successful articles remain
-cached. Wiki initialization retains generic `entities` and `concepts` categories
-alongside specialized page types.
-Updates append facts on the same knowledge page and preserve earlier facts, links and sources.
-New facts record their relationship to earlier facts and a reason; source-supported time qualifiers
-distinguish historical and newer statements. Isolated pages receive Python-generated singleton
-summaries, so every knowledge page has a summary navigation entry after a successful complete build.
-See [incremental knowledge and evidence IDs](docs/incremental-knowledge-evidence.md) for the contracts
-and a no-LLM singleton backfill command.
-See [the code review guide](docs/wiki-agent-implementation.md) for every changed
-function, the reasons behind it, and the retired behavior. The exact contracts
-are in [the wiki schema](configs/wiki-schema.md).
-
-The tool-call budget is `T_max = 15` by default. State updates, rejected calls,
-and answer submission count toward it; the last slot is reserved for submission.
-Each turn reports the remaining budget and evidence requirements. Initial summary
-retrieval is a separate bootstrap operation, logged with its embedding usage; subsequent
-`summary_search` calls consume the tool budget. The old custom field bonuses,
-`wiki_search`, and `--patience`/`--select-pages` remain removed.
-Use `--summary-mode hybrid|bm25|dense|tree` for controlled comparisons (default `hybrid`).
-Defaults: 20 candidates per retriever, up to 5 summaries, and 4000 tokens per
-summary/page response, including its JSON metadata. `--embedding-model` defaults
-to `EMBEDDING_MODEL` or `text-embedding-3-small`; the embedding endpoint/credentials
-default to the chat configuration. Dense failure is explicitly recorded and hybrid
-mode falls back to BM25. Directory browsing remains available for uncovered pages.
-`--retrieval-model` now selects the model for the entire QA loop. `--answer-model`
-is a deprecated alias; supplying two different models is rejected. The new evidence-only answer policy differs from the original paper
-runner: it does not fill gaps from model knowledge. Old benchmark results must
-not be presented as results of this refactor.
-
-For an existing digest-based wiki, build a separate output first. This is a
-rebuild from processed articles, not an automatic migration of old factual
-claims or citations. These build commands call your configured LLM:
-
-```bash
-python -m llm_wiki_bench.bench_ingest --dataset hotpotqa --limit 20 \
-  --wiki-dir wiki_output/hotpotqa/article-evidence/wiki
-
-# Inspect grouping without model calls or writes:
+# Inspect summary groups without writes or model calls.
 python -m llm_wiki_bench.build_summaries \
-  --wiki-dir wiki_output/hotpotqa/article-evidence/wiki --dry-run
+  --wiki-dir wiki_output/hotpotqa/demo/wiki --dry-run
 
-# Resume/build summaries independently, reusing unchanged successful groups:
+# Rebuild missing or stale summaries; reuse unchanged successful groups.
 python -m llm_wiki_bench.build_summaries \
-  --wiki-dir wiki_output/hotpotqa/article-evidence/wiki --limit 10
+  --wiki-dir wiki_output/hotpotqa/demo/wiki
 ```
 
-Pass the same `--wiki-dir` to `run_qa` to evaluate that build. `bench_ingest
---limit` counts articles; `run_qa --limit` counts questions. A small article
-build is a smoke test, not a complete question benchmark.
+The dataset runners also support `musique` and `2wikimhqa`.
 
-```bash
-# 1. Generate predictions (one JSONL line per question).
-python -m llm_wiki_bench.run_qa --dataset hotpotqa --limit 500
+### Use your own Markdown corpus
 
-# 2. Evaluate EM / F1 (with hop-wise and type-wise breakdowns).
-python -m llm_wiki_bench.evaluate \
-    --dataset hotpotqa \
-    --predictions results/hotpotqa/predictions.jsonl
-
-# Or do both in a single pass:
-python -m llm_wiki_bench.run_qa --dataset hotpotqa --limit 500 --evaluate
-```
-
-Results (predictions, summary, per-question details) are written under
-`results/<dataset>/`.
-Each prediction now includes `knowledge_evidence`, `article_evidence`, `evidence_chain`,
-`evidence_snapshots`, `evidence_status`, and `error`. `citations_validated` means the quotes and
-locations match the excerpts read; it does not certify semantic support. Knowledge-page
-citations include `{page, page_version, start_offset, end_offset, quote}`; original-article citations retain
-`{article, version, start_line, end_line, quote}`. Summaries are navigation only.
-
-Offline checks (no LLM calls):
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-## Build a wiki on your own corpus
-
-Place one Markdown file per article under `raw/<corpus_name>/articles/`, then:
+Place one article per file in `raw/my_corpus/articles/`. Save this as
+`build_my_corpus.py` in the repository root and run `python build_my_corpus.py`
+after loading your environment:
 
 ```python
 import sys
-sys.path.insert(0, "llm_wiki_bench")
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "llm_wiki_bench"))
 
 import bench_config as config
-import bench_ingest
+from bench_ingest import ingest_batch
 
-config.set_dataset("my_corpus")
+config.set_dataset("my_corpus", wiki_dir=Path("wiki_output/my_corpus/wiki"))
 config.ensure_wiki_dirs()
-article_paths = sorted(config.RAW_DIR.glob("*.md"))
-bench_ingest.ingest_batch(article_paths, batch_size=3)
+articles = sorted(config.RAW_DIR.glob("*.md"))
+if not articles:
+    raise SystemExit("No Markdown articles found.")
+stats = ingest_batch(articles, batch_size=3)
+if stats["failed"] or stats["summaries"]["failed"]:
+    raise SystemExit("Build incomplete; inspect the reported errors.")
 ```
 
-## Citation
+The benchmark QA CLI accepts the three dataset names above. Applications using
+another corpus can instantiate `WikiRetriever` and `WikiAgent` directly; see
+[`run_qa.py`](llm_wiki_bench/run_qa.py) for the initialization and result handling.
 
-If you find this code useful, please cite:
+## Retrieval settings and budgets
 
-```bibtex
-@misc{ming2026retrievalreasoningselfevolvingagentnative,
-      title={Retrieval as Reasoning: Self-Evolving Agent-Native Retrieval via LLM-Wiki},
-      author={Haoliang Ming and Feifei Li and Xiaoqing Wu and Wenhui Que},
-      year={2026},
-      eprint={2605.25480},
-      archivePrefix={arXiv},
-      primaryClass={cs.CL},
-      url={https://arxiv.org/abs/2605.25480},
-}
+| Setting                  | Default                                       | Behavior                                                                                                  |
+| ------------------------ | --------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `--retrieval-model`      | `LLM_PREMIUM_MODEL`                           | One model for retrieval decisions, evidence state, and answer submission.                                 |
+| `--summary-mode`         | `hybrid`                                      | Choose `hybrid`, `bm25`, `dense`, or `tree` for controlled comparisons.                                   |
+| `--summary-candidates`   | `20`                                          | Candidates per retriever before rank fusion.                                                              |
+| `--summary-limit`        | `5`                                           | Maximum summaries returned per search batch.                                                              |
+| `--summary-token-budget` | `4000`                                        | Serialized response budget for `summary_search` and `wiki_read`, including metadata and evidence entries. |
+| `--t-max`                | `15`                                          | Total tool-call budget, including state updates, failed calls, and answer submission.                     |
+| `--embedding-model`      | `EMBEDDING_MODEL` or `text-embedding-3-small` | Model for summary and query embeddings.                                                                   |
+
+Initial navigation runs before the agent loop and is logged separately from its
+tool budget. Later searches consume tool calls. The final slot is reserved for
+`finish_answer`; exhausting the budget without an accepted submission leaves
+`unknown`. Navigation token limits apply per response, not to the entire
+conversation. Article reads use line limits.
+
+Embeddings are cached under `.build/retrieval-embeddings.sqlite3`, keyed by
+endpoint, model, index version, and input content. In hybrid mode, embedding
+failure is recorded and retrieval falls back to BM25. Dense-only failure is
+reported as unavailable; directory navigation remains accessible.
+
+## Outputs and evaluation
+
+Predictions are written as JSONL, one record per question. `--output` selects the
+file and overwrites it on each run. Records include:
+
+- The answer, evidence chain, validation status, and stop reason.
+- Read knowledge-page and article excerpts, evidence snapshots, and requirements.
+- Initial navigation, subsequent summary searches, and tool-call records.
+- QA model token usage, embedding usage, elapsed time, and errors.
+
+`--evaluate` writes EM/F1 summaries and per-question details under
+`results/<dataset>/`. To evaluate a saved run into a separate report directory:
+
+```bash
+python -m llm_wiki_bench.evaluate \
+  --dataset hotpotqa --limit 10 \
+  --predictions results/hotpotqa/demo-predictions.jsonl \
+  --output-dir results/hotpotqa/demo-evaluation
 ```
+
+The evaluator currently reports missing predictions but excludes them from the
+EM/F1 denominator. Verify that every question in the intended evaluation scope
+has a prediction before comparing scores. `citations_validated` confirms matching
+read snapshots, not semantic correctness. Small builds and offline tests validate
+workflow behavior; benchmark accuracy requires a completed model run with fixed
+questions, corpus, models, and budgets.
+
+## Code map
+
+| File                                   | Responsibility                                                           |
+| -------------------------------------- | ------------------------------------------------------------------------ |
+| `llm_wiki_bench/run.py`                | Download → preprocess → ingest orchestration.                            |
+| `llm_wiki_bench/preprocess_bench.py`   | Dataset context extraction and separate QA records.                      |
+| `llm_wiki_bench/bench_config.py`       | Paths, model configuration, purpose, and page-type initialization.       |
+| `llm_wiki_bench/bench_ingest.py`       | Page selection, fact proposals, validation, retries, and build receipts. |
+| `llm_wiki_bench/wiki_documents.py`     | Article archives, document rendering, and source-reference checks.       |
+| `llm_wiki_bench/knowledge_updates.py`  | Fact IDs and preservation of earlier page knowledge.                     |
+| `llm_wiki_bench/build_summaries.py`    | Related-page grouping, summary generation, and freshness checks.         |
+| `llm_wiki_bench/summary_retrieval.py`  | BM25, dense ranking, and RRF.                                            |
+| `llm_wiki_bench/embedding_client.py`   | Embedding API calls and SQLite cache.                                    |
+| `llm_wiki_bench/token_budget.py`       | Response token accounting and text truncation.                           |
+| `llm_wiki_bench/wiki_retriever.py`     | Summary search, directory navigation, and page/article reads.            |
+| `llm_wiki_bench/wiki_agent.py`         | Unified QA loop, evidence requirements, and stopping rules.              |
+| `llm_wiki_bench/evidence_snapshots.py` | Evidence IDs and exact citation snapshots.                               |
+| `llm_wiki_bench/qa_contract.py`        | Submission schemas and deterministic citation validation.                |
+| `llm_wiki_bench/run_qa.py`             | QA execution and prediction persistence.                                 |
+| `llm_wiki_bench/evaluate.py`           | Answer normalization, EM/F1, and evaluation reports.                     |
+
+Detailed contracts: [Wiki schema](configs/wiki-schema.md),
+[incremental knowledge and evidence IDs](docs/incremental-knowledge-evidence.md),
+[summary retrieval](docs/summary-hybrid-retrieval.md),
+[QA loop](docs/qa-agent-loop.md), and
+[directory navigation](docs/wiki-tree-navigation.md).
+
+## Development checks
+
+```bash
+source .venv/bin/activate
+python -m unittest discover -s tests -v
+```
+
+Tests use scripted model responses to check ingestion, knowledge preservation,
+summary coverage, retrieval, navigation, evidence registration, and QA validation
+without LLM API calls.
 
 ## License
 
-Released under the MIT License. See [`LICENSE`](./LICENSE).
+MIT License. See [LICENSE](LICENSE).
