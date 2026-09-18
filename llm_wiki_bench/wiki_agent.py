@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from qa_contract import FINISH_TOOL, QA_CONTROL_TOOLS, validate_answer
+from evidence_snapshots import register_article, register_page
 from token_budget import dumps
 from wiki_retriever import WikiPage, WikiRetriever
 
@@ -47,16 +48,19 @@ source_read is NOT required. You may also use original articles directly. Never 
 After each read, check unresolved parts of the question and continue as needed. If evidence is missing,
 continue navigating to relevant knowledge pages or follow their source links for additional detail or verification.
 Use update_evidence_state to record requirements for EVERY hop or compared entity. Each requirement has
-an id, question, status (unresolved/supported), and citations. Updates merge by id; omitted entries remain.
-Supported requirements require exact citations from actually read knowledge-page excerpts or article passages.
+an id, question, status (unresolved/supported), and evidence_ids. Updates merge by id; omitted entries remain.
+Read results contain evidence entries with evidence_id and exact text. Select these IDs; Python generates citations.
+Supported requirements need evidence_ids from this question's read results. Unresolved requirements may use [].
 Do not treat an article link on a knowledge page as an original passage you have read.
 Use concise factual state, not a reasoning transcript. If new evidence changes the plan, revise it.
 Submit via finish_answer(answer, evidence_chain, requirements); ordinary text does NOT finish the task.
 You may include requirement updates in finish_answer to avoid an extra state-update call.
-Each answer hop must include requirement_id, claim, and exact citations. For knowledge pages use
-{page, quote}: copy a nonempty exact supporting quote from wiki_read, with the knowledge-page path.
-For original passages use {article, version, start_line, end_line, quote} returned by source_read.
-Both citation types may be used in one answer. Cover every recorded requirement. Do not infer nationality from
+Each answer hop must include requirement_id, claim, and evidence_ids. Never write quote, citations, path,
+version or line-range fields in submissions. Select multiple IDs when support spans multiple facts;
+do not concatenate or paraphrase source text. Summaries and relationship explanations have no evidence IDs.
+Knowledge-page and article evidence IDs may be mixed. Earlier and newer facts coexist: use the time/conditions
+asked for, read update reasons, and resolve conflicts with original articles when needed; do not silently discard older facts.
+Cover every recorded requirement. Do not infer nationality from
 birthplace or name order. If a submission is rejected, use its error to correct it or retrieve more evidence.
 Return answer="unknown" with an empty chain when evidence cannot be obtained.
 All tool calls count toward the budget, including state updates and failed submissions. Reserve the last
@@ -89,6 +93,7 @@ class RetrievalResult:
     usage_by_model: dict[str, dict[str, int]] = field(default_factory=dict)
     evidence: list[dict] = field(default_factory=list)         # exact article passages actually read
     page_evidence: list[dict] = field(default_factory=list)    # only knowledge-page excerpts returned to the model
+    evidence_registry: dict[str, dict] = field(default_factory=dict)  # question-local delivered snapshots
     requirements: list[dict] = field(default_factory=list)
     answer: dict = field(default_factory=lambda: {
         "prediction": "unknown", "evidence_chain": [], "evidence_status": "insufficient"})
@@ -161,7 +166,7 @@ class WikiAgent:
             messages.append({"role": "user", "content": json.dumps({
                 "remaining_tool_calls": remaining,
                 "submission_only": submission_only,
-                "requirements": result.requirements,
+                "requirements": [{k: v for k, v in item.items() if k != 'citations'} for item in result.requirements],
                 "navigation_token_budget_per_call": self.retriever.summary_token_budget,
                 "instruction": (
                     "Use finish_answer now with supported evidence, or unknown. No retrieval calls remain."
@@ -271,9 +276,11 @@ class WikiAgent:
                         page = self.retriever.pages.get(rp)
                         if page is not None and page.layer == "knowledge":
                             excerpt = {"page": rp, "text": item["text"],
-                                       "start_offset": item.get("start_offset", 0)}
+                                       "start_offset": item.get("start_offset", 0),
+                                       "page_version": item.get('page_version')}
                             if excerpt not in result.page_evidence:
                                 result.page_evidence.append(excerpt)
+                            register_page(item, result.evidence_registry)
                         if rp not in result.pages_text:
                             page = self.retriever.pages.get(rp)
                             result.pages.append((rp, item.get("name", rp)))
@@ -291,6 +298,7 @@ class WikiAgent:
             if "quote" in passage:
                 if passage not in result.evidence:
                     result.evidence.append(passage)
+                register_article(passage, result.evidence_registry)
                 rp = passage["article"]
                 page = self.retriever.pages[rp]
                 if rp not in result.pages_text:
@@ -322,19 +330,24 @@ class WikiAgent:
             seen.add(rid)
             if item.get("status") not in {"supported", "unresolved"}:
                 raise ValueError("requirement status must be supported or unresolved")
-            citations = item.get("citations", [])
-            if not isinstance(citations, list):
-                raise ValueError("requirement citations must be a list")
-            if item["status"] == "supported" or citations:
+            if 'citations' in item:
+                raise ValueError('submit evidence_ids, not handwritten citations; Python generates quotes')
+            evidence_ids = item.get('evidence_ids', [])
+            if not isinstance(evidence_ids, list) or any(not isinstance(e, str) for e in evidence_ids):
+                raise ValueError('requirement evidence_ids must be a list of IDs')
+            citations = []
+            if item["status"] == "supported" or evidence_ids:
                 checked = validate_answer({"answer": "validation", "evidence_chain": [
-                    {"claim": question, "citations": citations}]}, result.evidence, result.page_evidence)
+                    {"claim": question, "evidence_ids": evidence_ids}]}, result.evidence, result.page_evidence,
+                    evidence_registry=result.evidence_registry)
                 citations = checked["evidence_chain"][0]["citations"]
             merged[rid] = {"id": rid, "question": question,
-                           "status": item["status"], "citations": citations}
+                           "status": item["status"], 'evidence_ids': list(dict.fromkeys(evidence_ids)), "citations": citations}
         result.requirements = list(merged.values())
         if name == "update_evidence_state":
-            return json.dumps({"requirements": result.requirements}, ensure_ascii=False)
-        answer = validate_answer(args, result.evidence, result.page_evidence)
+            return json.dumps({"requirements": [{k: v for k, v in item.items() if k != 'citations'}
+                                                for item in result.requirements]}, ensure_ascii=False)
+        answer = validate_answer(args, result.evidence, result.page_evidence, evidence_registry=result.evidence_registry)
         if answer["prediction"] != "unknown":
             if not merged or any(item["status"] != "supported" for item in merged.values()):
                 raise ValueError("Unresolved evidence requirements: retrieve missing evidence before submitting")

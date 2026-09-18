@@ -38,7 +38,7 @@ class TokenBudget:
                 high = mid - 1
         return text[:low]
 
-    def fit_row(self, row: dict, limit: int) -> dict:
+    def fit_row(self, row: dict, limit: int, decorate=None) -> dict:
         """Trim text only, keeping a character offset into the original page body."""
         row = dict(row)
         text = row.get("text", "")
@@ -53,6 +53,8 @@ class TokenBudget:
             mid = (low + high + 1) // 2
             trial = {**row, "text": text[:mid], "truncated": start > 0 or start + mid < total,
                      "next_offset": start + mid if start + mid < total else None}
+            if decorate:
+                trial = decorate(trial)
             if self.count(dumps(trial)) <= limit:
                 low = mid
             else:
@@ -61,4 +63,4 @@ class TokenBudget:
                    next_offset=start + low if start + low < total else None)
         if not low and text:
             return {"path": row.get("path"), "error": "Read this path individually; metadata exceeds the batch budget."}
-        return row
+        return decorate(row) if decorate else row

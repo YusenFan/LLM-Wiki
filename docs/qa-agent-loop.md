@@ -14,11 +14,12 @@
 
 ## 状态与提交协议
 
-requirements 每项包含 `id`、`question`、`status`（`unresolved` 或 `supported`）和 `citations`。状态以 ID 合并更新；省略某一项不会删除它。更新先整体校验，坏更新不覆盖旧状态。`finish_answer` 也可携带更新，减少控制调用开销；有效更新即使答案提交失败也会保留。
+requirements 每项包含 `id`、`question`、`status`（`unresolved` 或 `supported`）和 `evidence_ids`。状态以 ID 合并更新；省略某一项不会删除它。更新先整体校验，坏更新不覆盖旧状态。`finish_answer` 也可携带更新，减少控制调用开销；有效更新即使答案提交失败也会保留。
 
-支持状态必须附有已读证据引用。知识页引用包含 `page` 和 `quote`；原文引用包含 `article`、`version`、`start_line`、`end_line`、`quote`，同一答案可混用两种引用。答案 evidence_chain 中的每一项还包含 `requirement_id` 和 `claim`。事实答案要求：
+支持状态必须附有本题实际读过的 `evidence_ids`；答案 evidence_chain 中的每一项包含 `requirement_id`、`claim` 和 `evidence_ids`。模型不再手写路径、引文或行号。Python 用本题的证据表生成引用：知识页为 `page`、`page_version`、字符起止位置和 `quote`；原文为 `article`、`version`、行范围和 `quote`。同一答案可混用两类 ID，非连续事实使用多个 ID。事实答案要求：
 
 - 至少登记一个需求，并且所有登记需求均为 supported。
+- 每个 ID 必须存在于本题实际返回内容的证据表中；搜索结果、目录、summary 和关系说明不产生可引用 ID。
 - 知识页引用必须逐字匹配 `wiki_read` 实际返回片段中的非空文本；截断后尚未读到的文本不可引用。
 - 原文引用必须来自 `source_read` 实际读过的版本、行范围和完整引文。
 - evidence_chain 覆盖所有登记需求 ID。
@@ -39,11 +40,11 @@ requirements 每项包含 `id`、`question`、`status`（`unresolved` 或 `suppo
 
 JSONL 保留既有 prediction、evidence_chain、article_evidence、evidence_requirements、evidence_gaps、stop_reason、tool_calls 等字段，并记录 `initial_navigation`、`summary_searches`、`embedding_usage` 和 `retrieval_config`。历史名称 `retrieval_llm_calls` 和 `retrieval_usage_by_model` 覆盖整个统一 QA 对话；embedding 不混入这些生成模型 token 统计。
 
-`knowledge_evidence` 单独保存实际返回的知识页片段及字符起始位置；`article_evidence` 仍仅记录实际读取的原文。只有知识页、没有原文存档的 Wiki 也允许执行 QA。
+`knowledge_evidence` 单独保存实际返回的知识页片段、版本及字符起始位置；`article_evidence` 仍仅记录实际读取的原文。`evidence_snapshots` 保存 ID 到精确引用的映射；最终 evidence_chain 同时保存模型选择的 ID 和 Python 生成的 citations。只有知识页、没有原文存档的 Wiki 也允许执行 QA。离线校验历史预测仍可使用旧 citations 格式，在线 agent 只接受 evidence_ids。
 
 使用 `--retrieval-model` 选择整段对话的模型；默认仍为 premium 配置，缺省回退 LLM_MODEL。`--answer-model` 作为旧参数别名保留；两参数指定不同模型会明确报错。
 
-目录导航和摘要文件名已更新，详见 [目录树导航](wiki-tree-navigation.md)。原文版本、摘要分组算法和评估分母保持原有规则。实际 benchmark 对比前需固定题集、语料、模型和总预算，并处理范围内缺失预测的计分。
+目录导航和摘要文件名已更新，详见 [目录树导航](wiki-tree-navigation.md)。摘要分组保留去重和严格子集删除规则，并为未被多页分组覆盖的孤立知识页保留 singleton 组。原文版本和评估分母保持原有规则。实际 benchmark 对比前需固定题集、语料、模型和总预算，并处理范围内缺失预测的计分。
 
 ## 文件与验证
 

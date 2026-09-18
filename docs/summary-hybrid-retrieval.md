@@ -12,9 +12,12 @@ BM25 使用完整词匹配、k1=1.5、b=0.75 和正 IDF；中文按字切分。D
 
 返回排名不是置信度，更不代表事实支持关系。RRF 只用于选择阅读入口；最终答案引用 wiki_read 实际读过的知识页，或按需 source_read 读过的原文。摘要本身不作为最终证据。
 
+`build_summaries` 为没有进入任何多页分组的孤立知识页生成 singleton summary。Python 复制该页的导航正文、移除来源链接并添加 Member Pages 入口，不调用 LLM、不制造关系。singleton 与多页摘要都按成员内容 fingerprint 判断是否有效；新关系使 singleton 成为严格子集后，旧 singleton 不再进入 current summaries。完整成功构建时所有知识页均被覆盖；结果中的 `covered_pages` 和 `uncovered_pages` 可检测失败、限额或只生成 singleton 导致的缺口。已有 Wiki 可用 `--singletons-only` 离线补齐孤立页，命令见 [增量知识与证据 ID](incremental-knowledge-evidence.md)。
+
 ## 阅读预算和补查
 
 - 默认每批最多 5 个 summary；可配置 1–10。单批 `summary_search` 和 `wiki_read` 的完整 JSON（含元数据）最多 4000 tokens，可配置 512–16000。预算小时会减少摘要数。
+- 知识页阅读结果中的证据 ID、版本和证据文本也计入完整 JSON 预算。截断后只为实际交付的文本登记证据；未读部分必须续读。
 - tokenizer 优先使用 QA 模型对应的 tiktoken encoding，未知模型使用 cl100k_base，结果会明确记录 tokenizer 名称。不同供应商 tokenizer 的精确计数可能不同。首次使用 tiktoken 需要下载公开词表。
 - 短摘要返回完整正文；长摘要从与查询有最多词项重叠的段落开始，返回截断窗口。这一步是确定性片段选择，不增加 LLM 调用。
 - 返回 `start_offset`、`total_chars`、`truncated` 和 `next_offset`。文本 offset 是 Markdown body 的字符位置，不包含 YAML frontmatter；`wiki_read(paths=[path], offset=next_offset)` 可继续读取。`start_offset > 0` 表示开头也有省略，可从 offset=0 阅读。

@@ -1,5 +1,6 @@
 """Offline behavioral checks of the unified QA loop; no model API calls."""
 import copy
+import hashlib
 import json
 import tempfile
 import unittest
@@ -11,6 +12,7 @@ from wiki_agent import WikiAgent, RetrievalResult
 from wiki_documents import archive_article, read_article
 from wiki_retriever import WikiRetriever
 from qa_contract import validate_answer
+from evidence_snapshots import evidence_id
 import run_qa
 
 
@@ -40,12 +42,20 @@ class QALoopTest(unittest.TestCase):
     def req(self, rid, citation=None):
         return {'id': rid, 'question': 'Founder?' if rid == 'founder' else 'Location?',
                 'status': 'supported' if citation else 'unresolved',
-                'citations': [citation] if citation else []}
+                'evidence_ids': [self.reference_id(citation)] if citation else []}
+
+    def reference_id(self, citation):
+        if 'page' in citation:
+            body = (self.root / citation['page']).read_text()
+            start = body.find(citation['quote'])
+            return evidence_id({**citation, 'page_version': hashlib.sha256(body.encode()).hexdigest(),
+                                'start_offset': start, 'end_offset': start + len(citation['quote'])})
+        return evidence_id({k: citation[k] for k in ('article', 'version', 'start_line', 'end_line', 'quote')})
 
     def finish(self, requirements=None, both=True):
         citations = [('founder', self.first), ('location', self.second)] if both else [('founder', self.first)]
         return call('finish_answer', answer='Paris', requirements=requirements or [], evidence_chain=[
-            {'requirement_id': rid, 'claim': cit['quote'], 'citations': [cit]} for rid, cit in citations])
+            {'requirement_id': rid, 'claim': cit['quote'], 'evidence_ids': [self.reference_id(cit)]} for rid, cit in citations])
 
     def read(self, start, end=None):
         return call('source_read', article=self.article, start_line=start, end_line=end or start)
@@ -59,7 +69,7 @@ class QALoopTest(unittest.TestCase):
         result = WikiAgent(self.retriever, call_llm_with_tools=model, t_max=budget).retrieve('Where is the company Alpha founded?')
         return result, snapshots
 
-    def knowledge_page(self, text='Alpha founded Beta. Beta is in Paris.'):
+    def knowledge_page(self, text='Alpha founded Beta.\nBeta is in Paris.'):
         path = self.root / 'entities/alpha.md'
         path.parent.mkdir(exist_ok=True)
         path.write_text(text)
@@ -68,7 +78,8 @@ class QALoopTest(unittest.TestCase):
     def page_finish(self, page, quote):
         citation = {'page': page, 'quote': quote}
         return call('finish_answer', answer='Paris', requirements=[self.req('location', citation)],
-                    evidence_chain=[{'requirement_id': 'location', 'claim': quote, 'citations': [citation]}])
+                    evidence_chain=[{'requirement_id': 'location', 'claim': quote,
+                                     'evidence_ids': [self.reference_id(citation)]}])
 
     def test_knowledge_page_answers_without_original_read(self):
         page = self.knowledge_page()
@@ -79,8 +90,9 @@ class QALoopTest(unittest.TestCase):
         self.assertEqual(result.answer['prediction'], 'Paris')
         self.assertEqual(result.evidence, [])
         self.assertEqual(len(result.page_evidence), 1)
-        self.assertEqual(result.answer['evidence_chain'][0]['citations'],
-                         [{'page': page, 'quote': 'Beta is in Paris.'}])
+        actual = result.answer['evidence_chain'][0]['citations'][0]
+        self.assertEqual((actual['page'], actual['quote']), (page, 'Beta is in Paris.'))
+        self.assertIn('page_version', actual)
 
     def test_unread_knowledge_page_requires_read_before_submission(self):
         page = self.knowledge_page()
@@ -100,7 +112,7 @@ class QALoopTest(unittest.TestCase):
             reply(self.read(2)),
             reply(call('finish_answer', answer='Paris',
                        requirements=[self.req('founder', first), self.req('location', self.second)],
-                       evidence_chain=[{'requirement_id': rid, 'claim': cit['quote'], 'citations': [cit]}
+                       evidence_chain=[{'requirement_id': rid, 'claim': cit['quote'], 'evidence_ids': [self.reference_id(cit)]}
                                        for rid, cit in [('founder', first), ('location', self.second)]])),
         ])
         self.assertEqual(result.answer['prediction'], 'Paris')
@@ -128,7 +140,7 @@ class QALoopTest(unittest.TestCase):
             reply(self.page_finish(page, 'Beta is located in Paris.')),
             reply(self.page_finish(page, 'Beta is in Paris.')),
         ])
-        self.assertIn('quote does not match', result.tool_calls[1]['result'])
+        self.assertIn('unknown evidence_ids', result.tool_calls[1]['result'])
         proposal = copy.deepcopy(result.answer)
         proposal['answer'] = proposal.pop('prediction')
         proposal['evidence_chain'][0]['citations'][0]['article'] = self.article
@@ -141,6 +153,8 @@ class QALoopTest(unittest.TestCase):
         summary = 'summaries/example.md'
         self.retriever.pages[summary] = self.retriever._parse_page(
             'example', Path(summary), 'Beta is in Paris.')
+        (self.root / 'summaries').mkdir(exist_ok=True)
+        (self.root / summary).write_text('Beta is in Paris.')
         result, _ = self.run_script([
             reply(call('wiki_read', paths=[summary, 'entities'])),
             reply(self.page_finish(summary, 'Beta is in Paris.')),

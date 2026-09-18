@@ -1,6 +1,7 @@
 # Wiki schema: article evidence and related-page summaries
 
-The evidence chain ends at the **processed article**:
+Knowledge facts retain links to their **processed articles**; QA may cite sufficiently
+explicit knowledge-page evidence directly and read articles for additional detail or verification:
 
 ```text
 summaries/ (navigation, tags, member knowledge pages)
@@ -62,13 +63,22 @@ Related Pages can have zero, one or many reliable links. Each target must be an
 existing knowledge page or a knowledge page created in the same batch; each link
 has a short relationship description. Do not manufacture links to meet a quota.
 
+Updates are append-only on the same knowledge page. Python preserves previous
+facts, sources, relationships and metadata, and unions aliases/tags. Each new fact
+on an existing page includes `change: {relation, reason, related_fact_ids, valid_at}`.
+Relations are `addition`, `elaboration`, `temporal_update`, `correction` or `conflict`.
+Non-additions must identify earlier facts from that page's supplied fact catalog;
+all changes need a reason. `valid_at` is a source-supported time or null, never an
+inferred ingestion timestamp. Changes are recorded in `knowledge_updates` metadata
+and a readable `Knowledge Updates` section; even corrected facts remain available.
+
 ## Summary grouping
 
 For every knowledge page, take `{itself} ∪ {existing Related Pages targets}`.
 Only explicit Related Pages entries with relationship descriptions participate.
 Articles, summaries, indexes and other links do not participate.
 
-1. Ignore singleton sets.
+1. Include singleton sets for isolated pages.
 2. Deduplicate identical sets regardless of member order.
 3. Remove a set if it is a strict subset of **one** other candidate set.
 4. Keep overlapping sets when neither contains the other.
@@ -77,6 +87,8 @@ Articles, summaries, indexes and other links do not participate.
 Example: retain `{A,B,C}` and `{A,B,D}`; omit `{A,B}`. If only A and B link to
 each other, produce one `{A,B}` summary. Coverage by a union of several groups
 is not sufficient to remove another group.
+An isolated `{C}` remains as a singleton group. Every knowledge page belongs to
+at least one group; actual summary coverage also requires those groups to build successfully.
 
 ## Summary pages
 
@@ -101,11 +113,13 @@ A high-level overview of the supplied knowledge pages.
 - [[entities/alpha]]
 - [[entities/beta]]
 
-Navigation only. Verify final claims in the cited article passages.
+Navigation only. Read member knowledge pages for answers; consult original articles when needed.
 ```
 
-Python owns membership and deduplication. The LLM writes title, description,
-tags and overview. A small fingerprint check avoids serving a cached summary
+Python owns membership and deduplication. For groups of two or more pages, the LLM
+writes title, description, tags and overview. Singleton navigation pages are generated
+by Python from the member page, with no model call. `generation` metadata records
+`python-singleton-v1` or `llm-related`. A small fingerprint check avoids serving a cached summary
 when its membership or member contents have changed; no history/repair agent
 is introduced. Obsolete files may remain on disk but are excluded from retrieval
 and regenerated summary indexes.
@@ -120,15 +134,18 @@ and regenerated summary indexes.
 - `wiki_tree(path?, depth?, offset?, limit?)` lists unranked directories and files
   with readable titles. Expand a subdirectory or continue with `next_offset`.
   Tree listings do not use relevance scores; summary ranking has no custom field bonuses.
-- `wiki_read(paths, offset?)` opens 1-10 navigation pages within the same token budget.
+- `wiki_read(paths, offset?)` opens 1-10 pages within the same token budget,
+  including evidence IDs and text for knowledge-page facts and descriptions.
   A truncated text returns `next_offset`, a character offset into the Markdown body;
   continue with one path. For an article it returns the path
   and line count, prompting `source_read` rather than treating navigation as proof.
-- `source_read(article, start_line, end_line)` returns actual article lines and
-  the version read. A call reads up to 200 lines, with an 80-line default window.
+- `source_read(article, start_line, end_line)` returns actual article lines,
+  the version read and evidence IDs. A call reads up to 200 lines, with an 80-line default window.
 - The same agent maintains evidence requirements and submits a short answer
-  through `finish_answer`, with an `evidence_chain` citing actual article reads.
-  Navigation content in the conversation is not final proof.
+  through `finish_answer`, with `evidence_ids` in requirements and each evidence-chain hop.
+  Python constructs citations from the question-local registry of delivered knowledge-page
+  and article snapshots. The model does not write quotes, paths, versions or ranges.
+  Summaries, directories and relationship descriptions do not supply evidence IDs.
 - Python verifies that citations lie inside read passages with matching versions
   and exact quotes. Invalid submissions return a tool error for correction within
   budget; failure to submit a validated answer leaves `unknown`.

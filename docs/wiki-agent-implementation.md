@@ -6,6 +6,8 @@
 
 > 后续构建修复见 [单题构建修复](build-test-one-fix.md)：知识页现使用 article 级链接，构建不再要求行号或逐字 quote。下文逐行引用的描述记录第一版设计；相关构建行为以修复说明为准。
 
+> 2026-09-18 更新：当前采用保留旧事实的增量更新、Python singleton summary 和 evidence_ids 提交协议。对应实现与迁移命令见 [增量知识与证据 ID](incremental-knowledge-evidence.md)；下文早期的覆盖式更新、忽略单页分组和模型手写 QA 引文描述已被替代。
+
 本次依据引用任务「重构Wiki原文引用与摘要」最后一次确认实施。当前 checkout 是旧 digest 实现，因此没有套用记忆中的另一套 FactStore/BuildAgent 架构。
 
 ## 先看这四条边界

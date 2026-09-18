@@ -92,7 +92,8 @@ BM25 and dense embeddings with reciprocal rank fusion (RRF). It can requery
 and answers directly from sufficient knowledge-page facts. Original article reads are optional
 for missing details, ambiguity, conflicts, or explicit verification requests.
 `update_evidence_state` records unresolved/supported requirements; `finish_answer`
-submits an answer with exact knowledge-page quotes or article citations. Rejected submissions return tool
+submits an answer with `evidence_ids` selected from actual read results. Python generates exact
+knowledge-page or article citations from the registered snapshots. Rejected submissions return tool
 errors so the agent can correct them or retrieve more evidence within budget.
 See [summary hybrid retrieval](docs/summary-hybrid-retrieval.md) for configuration, caching and budgets,
 [the unified QA loop](docs/qa-agent-loop.md) for state and stopping rules,
@@ -107,6 +108,12 @@ only unresolved articles as failed; recovered batch failures appear as warnings
 with diagnostic files containing the rejected attempts. Successful articles remain
 cached. Wiki initialization retains generic `entities` and `concepts` categories
 alongside specialized page types.
+Updates append facts on the same knowledge page and preserve earlier facts, links and sources.
+New facts record their relationship to earlier facts and a reason; source-supported time qualifiers
+distinguish historical and newer statements. Isolated pages receive Python-generated singleton
+summaries, so every knowledge page has a summary navigation entry after a successful complete build.
+See [incremental knowledge and evidence IDs](docs/incremental-knowledge-evidence.md) for the contracts
+and a no-LLM singleton backfill command.
 See [the code review guide](docs/wiki-agent-implementation.md) for every changed
 function, the reasons behind it, and the retired behavior. The exact contracts
 are in [the wiki schema](configs/wiki-schema.md).
@@ -165,9 +172,9 @@ python -m llm_wiki_bench.run_qa --dataset hotpotqa --limit 500 --evaluate
 Results (predictions, summary, per-question details) are written under
 `results/<dataset>/`.
 Each prediction now includes `knowledge_evidence`, `article_evidence`, `evidence_chain`,
-`evidence_status`, and `error`. `citations_validated` means the quotes and
+`evidence_snapshots`, `evidence_status`, and `error`. `citations_validated` means the quotes and
 locations match the excerpts read; it does not certify semantic support. Knowledge-page
-citations use `{page, quote}`; original-article citations retain
+citations include `{page, page_version, start_offset, end_offset, quote}`; original-article citations retain
 `{article, version, start_line, end_line, quote}`. Summaries are navigation only.
 
 Offline checks (no LLM calls):

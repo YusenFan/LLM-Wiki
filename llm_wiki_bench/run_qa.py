@@ -148,6 +148,7 @@ def main() -> None:
                 "retrieval_steps": rr.total_calls if rr else 0,
                 "article_evidence": rr.evidence if rr else [],
                 "knowledge_evidence": rr.page_evidence if rr else [],
+                "evidence_snapshots": rr.evidence_registry if rr else {},
                 "retrieval_llm_calls": rr.llm_calls if rr else 0,
                 "retrieval_usage_by_model": rr.usage_by_model if rr else {},
                 "evidence_requirements": rr.requirements if rr else [],

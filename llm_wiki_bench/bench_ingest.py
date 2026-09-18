@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 import bench_config as config
 from build_progress import show_progress
 from llm_client import call_llm_json
+from knowledge_updates import fact_catalog, merge_knowledge
 from wiki_documents import (
     RESERVED_DIRS, archive_article, knowledge_pages, parse_document,
     render_knowledge, wiki_path, write_document,
@@ -42,7 +43,14 @@ Rules:
 - Use concepts for abstract topics and methods when no specialized directory fits, and entities for otherwise unclassified entities.
 - Do not produce digests, summaries or indexes.
 - Use a listed page-type directory, canonical filenames and existing paths when updating a page.
-- When updating, preserve existing supported facts and citations; add the new information.
+- When updating an existing page, output additions only. Python preserves all earlier facts and sources.
+  Never delete, replace or silently overwrite old facts, even when newer evidence disagrees.
+- Each new fact on an existing page must include a change object:
+  {"relation": "addition|elaboration|temporal_update|correction|conflict", "reason": "why this adds to or differs from earlier knowledge",
+   "related_fact_ids": ["existing fact id"], "valid_at": "time explicitly supported by the source, or null"}.
+  Use the supplied Existing fact IDs. Non-addition changes must identify earlier related facts.
+  Keep both earlier and newer time-qualified statements. Do not invent dates or interpret ingestion time as fact time.
+  Unrelated new information uses addition with an empty related_fact_ids list and an explanatory reason.
 - Related Pages may contain any number of reliable entries, including zero or one. Never invent relations to meet a quota.
 - Link only existing knowledge pages or pages produced in this response. Include a short reason per link.
 - Text fields must be single-line text without wikilinks; Python renders links and Markdown.
@@ -119,6 +127,10 @@ def _validate_proposal(root, proposal, directories, existing, selected_pages, ar
     used_articles = set()
     for relative, page in pending.items():
         text, cited = render_knowledge(root, page, available)
+        if relative in selected_pages:
+            text = merge_knowledge(selected_pages[relative], text, page)
+            cited.update(p.removesuffix('.md') + '.md' for p in re.findall(
+                r'\[\[(sources/articles/[^\]#]+)(?:#L\d+-L\d+)?\]\]', text))
         rendered[relative] = text
         page_sources[relative] = cited
         used_articles.update(cited)
@@ -173,10 +185,12 @@ def _ingest_batch_one(batch_paths: list[Path], cache: dict, trace: dict | None =
     if not directories:
         raise ValueError("No knowledge-page directories configured")
     purpose = config.get_purpose_file().read_text(encoding="utf-8")
-    # Catalog and page contents are kept distinct: only read pages may be overwritten.
+    # Catalog and page contents are kept distinct: only read pages may receive additions.
     context = (f"Purpose:\n{purpose}\nPage types: {sorted(directories)}\nExisting paths:\n" + "\n".join(existing)
                + "\n\nInput articles:\n" + article_text
                + "\n\nSelected pages:\n" + "\n\n".join(f"### {p}\n{t}" for p, t in selected_pages.items())
+               + "\n\nExisting fact IDs by page:\n" + json.dumps(
+                   {p: fact_catalog(t) for p, t in selected_pages.items()}, ensure_ascii=False)
                + "\n\nExisting evidence:\n" + "\n\n".join(_article_context(a) for a in existing_evidence))
     trace["stage"] = "generate"
     trace["generation_input"] = context

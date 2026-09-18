@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -10,6 +11,7 @@ from pathlib import Path, PurePosixPath
 
 from build_summaries import current_summaries
 from embedding_client import EmbeddingClient
+from evidence_snapshots import decorate_article, decorate_page, page_units
 from summary_retrieval import SummaryIndex
 from token_budget import TokenBudget, dumps
 from wiki_documents import ARTICLE_PREFIX, parse_document, read_article, resolve_wiki_link, wiki_path
@@ -287,7 +289,13 @@ class WikiRetriever:
                     bounded.append({"path": item["path"], "error": "offset exceeds page length"})
                     continue
                 item = {**item, "text": text[offset:], "start_offset": offset, "total_chars": len(text)}
-            bounded.append(self.tokenizer.fit_row(item, per_row))
+            decorate = None
+            if item.get('meta', {}).get('layer') == 'knowledge':
+                page = self.pages[item['path']]
+                units = page_units(page.body)
+                version = hashlib.sha256(page.text.encode('utf-8')).hexdigest()
+                decorate = lambda row, units=units, version=version: decorate_page(row, units, version)
+            bounded.append(self.tokenizer.fit_row(item, per_row, decorate=decorate))
         if self.tokenizer.count(dumps(bounded)) > self.summary_token_budget:
             raise ValueError("Batch metadata exceeds read budget; request fewer paths")
         return bounded
@@ -340,9 +348,9 @@ class WikiRetriever:
                                    arguments.get("offset", 0)))
 
         if name == "source_read":
-            return json.dumps(self.source_read(arguments.get("article", ""),
+            return json.dumps(decorate_article(self.source_read(arguments.get("article", ""),
                                                arguments.get("start_line", 1),
-                                               arguments.get("end_line")), ensure_ascii=False)
+                                               arguments.get("end_line"))), ensure_ascii=False)
 
         return json.dumps({"error": f"unknown tool: {name}"})
 
@@ -388,7 +396,8 @@ WIKI_TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "wiki_read",
             "description": (
-                "Read 1-10 navigation pages within the configured token budget. Follow article links for evidence. "
+                "Read 1-10 pages within the configured token budget. Knowledge pages return evidence IDs for answers. "
+                "Summaries and directories are navigation only and have no evidence IDs. "
                 "Text may be truncated: continue a single path with next_offset (character offset into page body). "
                 "For a directory, prefer wiki_tree pagination."
             ),
@@ -415,7 +424,7 @@ WIKI_TOOL_SCHEMAS.append({
     "type": "function",
     "function": {
         "name": "source_read",
-        "description": "Optionally read original article lines for missing details, ambiguity, conflicts, or original-source verification. Knowledge-page evidence is sufficient when it explicitly answers the question.",
+        "description": "Optionally read original article lines with evidence IDs for missing details, ambiguity, conflicts, or original-source verification. Knowledge-page evidence is sufficient when it explicitly answers the question.",
         "parameters": {
             "type": "object",
             "properties": {

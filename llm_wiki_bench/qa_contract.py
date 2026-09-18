@@ -1,9 +1,11 @@
 """Deterministic citation checks shared by QA entry points. Not semantic verification."""
 
 from wiki_documents import resolve_wiki_link
+from evidence_snapshots import resolve_evidence
 
 
-def validate_answer(proposal: dict, evidence: list[dict], page_evidence: list[dict] | None = None) -> dict:
+def validate_answer(proposal: dict, evidence: list[dict], page_evidence: list[dict] | None = None,
+                    evidence_registry: dict | None = None) -> dict:
     """Check every submitted citation against passages read, without claiming semantic proof."""
     if not isinstance(proposal, dict) or not isinstance(proposal.get("answer"), str):
         raise ValueError("answer must be a JSON object with an answer string")
@@ -22,7 +24,13 @@ def validate_answer(proposal: dict, evidence: list[dict], page_evidence: list[di
     for hop in chain:
         if not isinstance(hop, dict) or not isinstance(hop.get("claim"), str) or not hop["claim"].strip():
             raise ValueError("each hop requires a claim")
-        citations = hop.get("citations")
+        if evidence_registry is not None:
+            if 'citations' in hop:
+                raise ValueError('submit evidence_ids, not handwritten citations; Python generates quotes')
+            citations = resolve_evidence(hop.get('evidence_ids'), evidence_registry)
+        else:
+            # Offline validation of historical predictions remains supported.
+            citations = hop.get("citations")
         if not isinstance(citations, list) or not citations:
             raise ValueError("each hop requires knowledge-page or article citations")
         normalized_citations = []
@@ -38,7 +46,15 @@ def validate_answer(proposal: dict, evidence: list[dict], page_evidence: list[di
                     raise ValueError("knowledge-page citation requires a nonempty exact quote")
                 if not any(p["page"] == page and quote in p["text"] for p in page_evidence):
                     raise ValueError("knowledge-page citation is unread or quote does not match a wiki_read excerpt")
-                normalized_citations.append({"page": page, "quote": quote})
+                if evidence_registry is not None and not any(
+                        p['page'] == page and p.get('page_version') == citation['page_version']
+                        and p.get('start_offset', 0) <= citation['start_offset'] < citation['end_offset']
+                        <= p.get('start_offset', 0) + len(p['text'])
+                        and p['text'][citation['start_offset']-p.get('start_offset', 0):
+                                      citation['end_offset']-p.get('start_offset', 0)] == quote
+                        for p in page_evidence):
+                    raise ValueError('evidence ID does not match the delivered page snapshot')
+                normalized_citations.append({**citation, "page": page, "quote": quote})
                 continue
             citation = {**citation, "article": resolve_wiki_link(citation.get("article", ""), known_paths)}
             start, end = citation.get("start_line"), citation.get("end_line")
@@ -71,29 +87,8 @@ def validate_answer(proposal: dict, evidence: list[dict], page_evidence: list[di
     return {"prediction": answer, "evidence_chain": normalized_chain, "evidence_status": "citations_validated"}
 
 
-ARTICLE_CITATION_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "article": {"type": "string"}, "version": {"type": "string"},
-        "start_line": {"type": "integer"}, "end_line": {"type": "integer"},
-        "quote": {"type": "string"},
-    },
-    "required": ["article", "version", "start_line", "end_line", "quote"],
-}
-CITATION_SCHEMA = {
-    "anyOf": [
-        {
-            "type": "object",
-            "properties": {
-                "page": {"type": "string", "description": "Knowledge-page path actually read with wiki_read; not a summary or article."},
-                "quote": {"type": "string", "description": "Exact supporting text copied from a returned wiki_read excerpt."},
-            },
-            "required": ["page", "quote"],
-            "additionalProperties": False,
-        },
-        ARTICLE_CITATION_SCHEMA,
-    ],
-}
+EVIDENCE_IDS_SCHEMA = {"type": "array", "items": {"type": "string"},
+                       "description": "IDs from this question's wiki_read/source_read evidence. Never write quotes or paths."}
 REQUIREMENTS_SCHEMA = {
     "type": "array",
     "description": "Upsert requirements by id. Include every hop or compared entity; omitted ids remain. Empty list means no updates.",
@@ -102,9 +97,10 @@ REQUIREMENTS_SCHEMA = {
         "properties": {
             "id": {"type": "string"}, "question": {"type": "string"},
             "status": {"type": "string", "enum": ["unresolved", "supported"]},
-            "citations": {"type": "array", "items": CITATION_SCHEMA},
+            "evidence_ids": EVIDENCE_IDS_SCHEMA,
         },
-        "required": ["id", "question", "status", "citations"],
+        "required": ["id", "question", "status", "evidence_ids"],
+        "additionalProperties": False,
     },
 }
 FINISH_TOOL = {
@@ -126,9 +122,10 @@ FINISH_TOOL = {
                         "properties": {
                             "requirement_id": {"type": "string"},
                             "claim": {"type": "string"},
-                            "citations": {"type": "array", "items": CITATION_SCHEMA},
+                            "evidence_ids": EVIDENCE_IDS_SCHEMA,
                         },
-                        "required": ["requirement_id", "claim", "citations"],
+                        "required": ["requirement_id", "claim", "evidence_ids"],
+                        "additionalProperties": False,
                     },
                 },
             },
@@ -141,7 +138,7 @@ QA_CONTROL_TOOLS = [
         "type": "function",
         "function": {
             "name": "update_evidence_state",
-            "description": "Record unresolved subquestions or support them with exact read knowledge-page or article citations. This is a factual task state, not a reasoning transcript.",
+            "description": "Record unresolved subquestions or support them with evidence_ids from actually read knowledge pages or articles. Python generates citations. This is factual task state, not a reasoning transcript.",
             "parameters": {
                 "type": "object", "properties": {"requirements": REQUIREMENTS_SCHEMA},
                 "required": ["requirements"],

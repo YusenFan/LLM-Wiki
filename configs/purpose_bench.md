@@ -17,7 +17,7 @@ them.
 - Priority extraction: key facts, entity relationships, temporal information,
   causal connections.
 - Moderate extraction: background context, categorical information.
-- Merge redundant information into existing facts while retaining citations to every supporting input article. Each input article must support at least one output fact.
+- Reuse existing fact wording for redundant information and retain every supporting input article citation. Python preserves earlier facts and appends additions; never replace old facts. Explain each new fact's relationship to earlier knowledge, including source-supported time changes. Each input article must support at least one output fact.
 
 ## Target Use Case
 

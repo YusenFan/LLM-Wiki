@@ -13,6 +13,7 @@ import bench_ingest
 from build_summaries import build_summaries, current_summaries, summary_groups, summary_path
 from run_qa import validate_answer
 from wiki_agent import WikiAgent
+from evidence_snapshots import evidence_id
 from wiki_documents import (
     archive_article, article_reference, citation_link, knowledge_pages, parse_document, read_article,
     related_pages, render_knowledge, validate_citation, wiki_path,
@@ -102,7 +103,7 @@ class WorkflowTest(unittest.TestCase):
         self.graph()
         self.assertEqual(summary_groups(knowledge_pages(self.root)), [
             ('entities/a.md', 'entities/b.md', 'entities/c.md'),
-            ('entities/a.md', 'entities/b.md', 'entities/d.md')])
+            ('entities/a.md', 'entities/b.md', 'entities/d.md'), ('entities/solo.md',)])
         pair = {'entities/a.md': graph_page('entities/b.md'), 'entities/b.md': graph_page('entities/a.md')}
         self.assertEqual(summary_groups(pair), [('entities/a.md', 'entities/b.md')])
         self.assertEqual(summary_path(tuple(pair)), summary_path(tuple(reversed(pair))))
@@ -123,7 +124,7 @@ class WorkflowTest(unittest.TestCase):
         self.write('entities/b.md', graph_page())
         self.write('entities/c.md', graph_page())
         self.write('summaries/old.md', graph_page('entities/c.md'))
-        self.assertEqual(summary_groups(knowledge_pages(self.root)), [('entities/a.md', 'entities/b.md')])
+        self.assertEqual(summary_groups(knowledge_pages(self.root)), [('entities/a.md', 'entities/b.md'), ('entities/c.md',)])
 
     def test_summaries_cache_failures_staleness_and_no_recursive_groups(self):
         self.graph()
@@ -131,30 +132,30 @@ class WorkflowTest(unittest.TestCase):
                     'tags': ['history, culture'], 'summary': 'An overview of the related pages.'}
         generator = Mock(side_effect=[RuntimeError('temporary failure'), response])
         stats = build_summaries(self.root, generate=generator)
-        self.assertEqual((stats['built'], stats['failed']), (1, 1))
+        self.assertEqual((stats['built'], stats['failed']), (2, 1))
         retry = Mock(return_value=response)
         stats = build_summaries(self.root, generate=retry)
-        self.assertEqual((stats['built'], stats['cached']), (1, 1))
+        self.assertEqual((stats['built'], stats['cached']), (1, 2))
         self.assertEqual(retry.call_count, 1)
-        self.assertEqual(len(current_summaries(self.root)), 2)
+        self.assertEqual(len(current_summaries(self.root)), 3)
         for text in current_summaries(self.root).values():
             meta, body = parse_document(text)
-            self.assertEqual(meta['tags'], ['history, culture'])
+            if len(meta['members']) > 1:
+                self.assertEqual(meta['tags'], ['history, culture'])
             for member in meta['members']:
                 self.assertIn(f'[[{member[:-3]}]]', body)
         self.write('entities/c.md', graph_page() + '\nChanged knowledge.')
-        self.assertEqual(len(current_summaries(self.root)), 1)
-        self.assertEqual(len(summary_groups(knowledge_pages(self.root))), 2)
+        self.assertEqual(len(current_summaries(self.root)), 2)
+        self.assertEqual(len(summary_groups(knowledge_pages(self.root))), 3)
         self.write('entities/a.md', graph_page())
         self.write('entities/b.md', graph_page())
-        self.assertEqual(current_summaries(self.root), {})
-        self.assertFalse(any(e.get('layer') == 'summaries' for e in WikiRetriever(self.root).tree()['entries']))
+        self.assertEqual(len(current_summaries(self.root)), 1)  # Unchanged singleton remains current.
 
     def test_summary_limit_leaves_retryable_pending(self):
         self.graph()
         generate = Mock(return_value={'title': 'Group', 'description': 'Overview', 'tags': [], 'summary': 'Text'})
         stats = build_summaries(self.root, limit=1, generate=generate)
-        self.assertEqual((stats['built'], stats['pending']), (1, 1))
+        self.assertEqual((stats['built'], stats['pending']), (1, 2))
         self.assertEqual(generate.call_count, 1)
 
     def test_ingest_success_cache_and_failed_output_never_cached(self):
@@ -236,7 +237,9 @@ class WorkflowTest(unittest.TestCase):
         article = archive_article(self.root, second)
         initial = {'pages': [self.proposal()]}
         combined = self.proposal()
-        combined['facts'].append({'text': 'Beta grew.', 'citations': [{'article': article['article']}]})
+        combined['facts'].append({'text': 'Beta grew.', 'citations': [{'article': article['article']}],
+                                 'change': {'relation': 'addition', 'reason': 'Additional growth information',
+                                            'related_fact_ids': [], 'valid_at': None}})
         # Three rejected batch proposals, first singleton, fresh selection, second singleton.
         responses = [initial] * 4 + [{'pages_to_view': ['entities/alpha.md']}, {'pages': [combined]}]
         with self.config_patches(), patch.object(config, 'get_page_types', return_value={'entities': {}}), \
@@ -312,7 +315,7 @@ class WorkflowTest(unittest.TestCase):
             with self.subTest(link=link):
                 passage = json.loads(retriever.execute_tool('source_read', {
                     'article': link, 'start_line': 7, 'end_line': 7}))
-                self.assertEqual(passage, self.citation)
+                self.assertEqual({k: v for k, v in passage.items() if k != 'evidence'}, self.citation)
                 self.assertEqual(retriever.read([link])[0]['path'], passage['article'])
 
     def test_resolved_source_links_still_enforce_article_and_range_contracts(self):
@@ -399,9 +402,10 @@ class WorkflowTest(unittest.TestCase):
             {'id': str(i), 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(args)}}]}
                    for i, (name, args) in enumerate(steps)]
         citations = second['facts'][0]['citations']
+        ids = [evidence_id({k: c[k] for k in ('article', 'version', 'start_line', 'end_line', 'quote')}) for c in citations]
         proposal = {'answer': 'Paris', 'requirements': [
-            {'id': 'location', 'question': 'Where is Beta?', 'status': 'supported', 'citations': citations}],
-            'evidence_chain': [{'requirement_id': 'location', 'claim': 'Beta is in Paris', 'citations': citations}]}
+            {'id': 'location', 'question': 'Where is Beta?', 'status': 'supported', 'evidence_ids': ids}],
+            'evidence_chain': [{'requirement_id': 'location', 'claim': 'Beta is in Paris', 'evidence_ids': ids}]}
         replies.append({'role': 'assistant', 'content': None, 'tool_calls': [
             {'id': 'finish', 'type': 'function', 'function': {
                 'name': 'finish_answer', 'arguments': json.dumps(proposal)}}]})
@@ -452,7 +456,9 @@ class WorkflowTest(unittest.TestCase):
         second.write_text('# Beta\n\nBeta grew.\n')
         article = archive_article(self.root, second)
         proposal = self.proposal()
-        proposal['facts'].append({'text': 'Beta grew.', 'citations': [{'article': article['article']}]})
+        proposal['facts'].append({'text': 'Beta grew.', 'citations': [{'article': article['article']}],
+                                 'change': {'relation': 'addition', 'reason': 'Additional growth information',
+                                            'related_fact_ids': [], 'valid_at': None}})
         with self.config_patches(), patch.object(config, 'get_page_types', return_value={'entities': {}}):
             with patch.object(bench_ingest, 'call_llm_json', side_effect=[
                 {'pages_to_view': ['entities/alpha.md']}, {'pages': [proposal]}]) as llm:
@@ -476,8 +482,11 @@ class WorkflowTest(unittest.TestCase):
     def test_nonexistent_selection_is_reported_without_rejecting_valid_reads(self):
         self.write('entities/alpha.md', graph_page())
         selection = {'pages_to_view': ['entities/alpha.md', 'entities/new.md', 'entities/alpha.md']}
+        proposal = self.proposal()
+        proposal['facts'][0]['change'] = {'relation': 'addition', 'reason': 'First sourced fact on this page',
+                                         'related_fact_ids': [], 'valid_at': None}
         with self.config_patches(), patch.object(config, 'get_page_types', return_value={'entities': {}}):
-            with patch.object(bench_ingest, 'call_llm_json', side_effect=[selection, {'pages': [self.proposal()]}]):
+            with patch.object(bench_ingest, 'call_llm_json', side_effect=[selection, {'pages': [proposal]}]):
                 stats = bench_ingest.ingest_batch([self.raw])
         self.assertEqual(stats['success'], 1)
         self.assertEqual(stats['failed'], 0)
