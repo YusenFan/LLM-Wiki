@@ -1,5 +1,8 @@
 # LLM-Wiki
 
+Azure GLM 5.2 Fast and Qwen3-Embedding-8B setup and bounded smoke test:
+[Azure model integration](docs/azure-models.md).
+
 LLM-Wiki turns documents into a persistent, linked knowledge base and answers
 questions using evidence read from that knowledge base. It separates **offline
 knowledge construction** from **online question answering**: articles are archived,

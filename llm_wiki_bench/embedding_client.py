@@ -11,6 +11,8 @@ from pathlib import Path
 
 import requests
 
+from model_auth import auth_headers
+
 
 def unit_vector(value) -> list[float]:
     if (not isinstance(value, list) or not value
@@ -27,23 +29,56 @@ class EmbeddingClient:
         self.model = model or os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
         chat_base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
         self.base_url = os.environ.get("EMBEDDING_BASE_URL", chat_base).rstrip("/")
+        self.protocol = os.environ.get("EMBEDDING_PROTOCOL", "openai")
+        if self.protocol not in {"openai", "tei"}:
+            raise ValueError("EMBEDDING_PROTOCOL must be openai or tei")
+        suffix = "embeddings" if self.protocol == "openai" else "embed"
+        self.endpoint = os.environ.get("EMBEDDING_ENDPOINT", f"{self.base_url}/{suffix}")
         self.api_key = os.environ.get("EMBEDDING_API_KEY", "")
-        if not self.api_key and self.base_url == chat_base:
+        if (not self.api_key and self.base_url == chat_base
+                and self.endpoint == f"{chat_base}/embeddings"):
             self.api_key = os.environ.get("OPENAI_API_KEY", "")
+        self.dimensions = int(os.environ["EMBEDDING_DIMENSIONS"]) if os.environ.get("EMBEDDING_DIMENSIONS") else None
+        self.batch_size = int(os.environ.get("EMBEDDING_BATCH_SIZE", "16"))
+        self.timeout = int(os.environ.get("EMBEDDING_TIMEOUT", "45"))
+        self.chunk_tokens = int(os.environ.get("EMBEDDING_CHUNK_TOKENS", "6000"))
+        self.tokenizer_model = os.environ.get("EMBEDDING_TOKENIZER_MODEL", "text-embedding-3-small")
+        is_qwen = "qwen" in self.model.lower()
+        self.max_input_bytes = int(os.environ.get("EMBEDDING_MAX_INPUT_BYTES", "12000" if is_qwen else "0"))
+        self.query_instruction = os.environ.get("EMBEDDING_QUERY_INSTRUCTION",
+            "Given a question, retrieve relevant wiki summaries that help answer it." if is_qwen else "")
+        if (self.batch_size < 1 or self.timeout < 1 or self.chunk_tokens < 1
+                or self.max_input_bytes < 0 or (self.dimensions is not None and self.dimensions < 1)):
+            raise ValueError("Embedding sizes, dimensions and timeout must be positive")
         self.cache_path = cache_path
         self.stats = {"requests": 0, "input_tokens": 0, "cache_hits": 0, "embedded_texts": 0}
-        self.namespace = json.dumps(["summary-v1", self.base_url, self.model])
+        self.namespace = json.dumps(["summary-v2", self.endpoint, self.protocol, self.model,
+                                     os.environ.get("EMBEDDING_MODEL_VERSION", ""), self.dimensions,
+                                     self.query_instruction])
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self.embed(texts)
+
+    def embed_queries(self, texts: list[str]) -> list[list[float]]:
+        if self.query_instruction:
+            texts = [f"Instruct: {self.query_instruction}\nQuery: {text}" for text in texts]
+        return self.embed(texts)
 
     def _request(self, texts: list[str]) -> list[list[float]]:
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+        if self.max_input_bytes and any(len(text.encode("utf-8")) > self.max_input_bytes for text in texts):
+            raise ValueError("Embedding input exceeds configured byte budget; split documents or shorten query")
+        if self.protocol == "openai":
+            body = {"model": self.model, "input": texts, "encoding_format": "float"}
+        else:
+            body = {"inputs": texts, "normalize": True, "truncate": False}
+        if self.dimensions is not None:
+            body["dimensions"] = self.dimensions
         for attempt in range(2):
             self.stats["requests"] += 1
             try:
-                response = requests.post(f"{self.base_url}/embeddings", headers=headers,
-                                         json={"model": self.model, "input": texts, "encoding_format": "float"},
-                                         timeout=45)
+                response = requests.post(self.endpoint,
+                                         headers=auth_headers("EMBEDDING", self.api_key, self.endpoint),
+                                         json=body, timeout=self.timeout)
             except requests.RequestException:
                 if attempt == 0:
                     time.sleep(1)
@@ -58,14 +93,18 @@ class EmbeddingClient:
                 raise RuntimeError(f"Embedding endpoint returned HTTP {response.status_code}; check embedding configuration")
             try:
                 payload = response.json()
-                data = payload["data"]
+                data = (payload["data"] if self.protocol == "openai" else
+                        [{"index": i, "embedding": vector} for i, vector in enumerate(payload)])
                 if (len(data) != len(texts) or any(type(row["index"]) is not int for row in data)
                         or sorted(row["index"] for row in data) != list(range(len(texts)))):
                     raise ValueError("invalid embedding response indices")
                 vectors = [unit_vector(row["embedding"]) for row in sorted(data, key=lambda r: r["index"])]
                 if len({len(v) for v in vectors}) != 1:
                     raise ValueError("inconsistent embedding dimensions")
-                self.stats["input_tokens"] += int(payload.get("usage", {}).get("prompt_tokens", 0))
+                if self.dimensions is not None and any(len(v) != self.dimensions for v in vectors):
+                    raise ValueError("unexpected embedding dimension")
+                if self.protocol == "openai":
+                    self.stats["input_tokens"] += int(payload.get("usage", {}).get("prompt_tokens", 0))
                 self.stats["embedded_texts"] += len(texts)
                 return vectors
             except (ValueError, TypeError, KeyError):
@@ -89,14 +128,15 @@ class EmbeddingClient:
                     vectors[key] = unit_vector(json.loads(row[0])) if row else None
                 except (ValueError, TypeError):
                     vectors[key] = None
+                if self.dimensions is not None and vectors[key] is not None and len(vectors[key]) != self.dimensions:
+                    vectors[key] = None
                 if vectors[key] is not None:
                     self.stats["cache_hits"] += 1
                 else:
                     missing[key] = text
             entries = list(missing.items())
-            # Summary index chunks are <= 6000 tokens: 16 inputs remain below request token limits.
-            for offset in range(0, len(entries), 16):
-                batch = entries[offset:offset + 16]
+            for offset in range(0, len(entries), self.batch_size):
+                batch = entries[offset:offset + self.batch_size]
                 fetched = self._request([text for _, text in batch])
                 for (key, _), vector in zip(batch, fetched):
                     vectors[key] = vector

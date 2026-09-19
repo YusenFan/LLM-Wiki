@@ -95,20 +95,27 @@ class SummaryIndex:
         if self.embedder is None:
             raise RuntimeError("No embedding client configured")
         if self._chunks is None:
-            tokenizer = TokenBudget("text-embedding-3-small")
+            tokenizer = TokenBudget(getattr(self.embedder, "tokenizer_model", "text-embedding-3-small"))
+            chunk_tokens = getattr(self.embedder, "chunk_tokens", 6000)
+            byte_limit = getattr(self.embedder, "max_input_bytes", 0)
             texts, owners = [], []
             for i, doc in enumerate(self.docs):
                 remainder = doc.search_text
                 while remainder:
-                    part = tokenizer.prefix(remainder, 6000)
+                    part = tokenizer.prefix(remainder, chunk_tokens)
+                    if byte_limit:
+                        # Conservative UTF-8 byte bound in addition to the explicitly approximate tokenizer.
+                        part = part.encode("utf-8")[:byte_limit].decode("utf-8", errors="ignore")
+                    if not part:
+                        raise ValueError("Embedding chunk budget cannot fit the next character")
                     texts.append(part)
                     owners.append(i)
                     remainder = remainder[len(part):]
-            vectors = self.embedder.embed(texts)
+            vectors = getattr(self.embedder, "embed_documents", self.embedder.embed)(texts)
             if len(vectors) != len(texts):
                 raise RuntimeError("Embedding client returned the wrong document count")
             self._chunks = [(i, unit_vector(v)) for i, v in zip(owners, vectors)]
-        vector = unit_vector(self.embedder.embed([query])[0])
+        vector = unit_vector(getattr(self.embedder, "embed_queries", self.embedder.embed)([query])[0])
         scores = {}
         for i, document in self._chunks:
             if self.docs[i].path in excluded:

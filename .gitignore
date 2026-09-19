@@ -24,3 +24,4 @@ logs/
 purpose_hotpotqa.md
 # local credentials
 .env
+.env.azure
