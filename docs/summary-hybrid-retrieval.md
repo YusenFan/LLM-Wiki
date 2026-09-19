@@ -29,7 +29,7 @@ BM25 使用完整词匹配、k1=1.5、b=0.75 和正 IDF；中文按字切分。D
 
 ## Embedding 配置与缓存
 
-默认 `text-embedding-3-small`，可通过 `--embedding-model` 或 `EMBEDDING_MODEL` 设置。`EMBEDDING_BASE_URL` 默认跟随 `OPENAI_BASE_URL`；在同一 endpoint 下 `EMBEDDING_API_KEY` 默认复用 `OPENAI_API_KEY`。若使用不同 endpoint，需显式设置 `EMBEDDING_API_KEY`，不会自动转发 chat 凭证。
+默认 `text-embedding-3-large`，可通过 `--embedding-model` 或 `EMBEDDING_MODEL` 设置。`EMBEDDING_BASE_URL` 默认跟随 `OPENAI_BASE_URL`；在同一 endpoint 下 `EMBEDDING_API_KEY` 默认复用 `OPENAI_API_KEY`。若使用不同 endpoint，需显式设置 `EMBEDDING_API_KEY`，不会自动转发 chat 凭证。
 
 SQLite 缓存在 Wiki 的 `.build/retrieval-embeddings.sqlite3`。内部 key 包括索引版本、endpoint、模型名和实际输入文本，hash 仅用于缓存身份，既不作为公开文件名，也不参与匹配。摘要文本变化重新 embedding，未变化片段和相同查询复用缓存；旧缓存项可以保留但不会因此使失效摘要重新进入索引。该版本本地扫描向量，不需要向量数据库。
 

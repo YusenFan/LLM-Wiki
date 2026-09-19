@@ -1,6 +1,6 @@
 # LLM-Wiki
 
-Azure GLM 5.2 Fast and Qwen3-Embedding-8B setup and bounded smoke test:
+Azure GLM 5.2 Fast and text-embedding-3-large setup and bounded smoke test:
 [Azure model integration](docs/azure-models.md).
 
 LLM-Wiki turns documents into a persistent, linked knowledge base and answers
@@ -191,7 +191,7 @@ export OPENAI_API_KEY="your-api-key"
 export OPENAI_BASE_URL="https://api.openai.com/v1"
 export LLM_FAST_MODEL="gpt-4o-mini"
 export LLM_PREMIUM_MODEL="gpt-4o"
-export EMBEDDING_MODEL="text-embedding-3-small"
+export EMBEDDING_MODEL="text-embedding-3-large"
 ```
 
 The client uses an OpenAI-compatible HTTP API. The fast model selects existing
@@ -305,7 +305,7 @@ another corpus can instantiate `WikiRetriever` and `WikiAgent` directly; see
 | `--summary-limit`        | `5`                                           | Maximum summaries returned per search batch.                                                              |
 | `--summary-token-budget` | `4000`                                        | Serialized response budget for `summary_search` and `wiki_read`, including metadata and evidence entries. |
 | `--t-max`                | `15`                                          | Total tool-call budget, including state updates, failed calls, and answer submission.                     |
-| `--embedding-model`      | `EMBEDDING_MODEL` or `text-embedding-3-small` | Model for summary and query embeddings.                                                                   |
+| `--embedding-model`      | `EMBEDDING_MODEL` or `text-embedding-3-large` | Model for summary and query embeddings.                                                                   |
 
 Initial navigation runs before the agent loop and is logged separately from its
 tool budget. Later searches consume tool calls. The final slot is reserved for

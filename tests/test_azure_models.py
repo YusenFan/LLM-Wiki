@@ -1,4 +1,4 @@
-"""Azure protocol and Qwen input/cache checks. All inference and CLI calls are mocked."""
+"""Azure protocol and embedding input/cache checks. All inference and CLI calls are mocked."""
 import json
 import os
 from pathlib import Path
@@ -103,13 +103,13 @@ class AzureAuthTest(unittest.TestCase):
             run.assert_not_called()
 
 
-class QwenEmbeddingTest(unittest.TestCase):
+class AzureEmbeddingTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.cache = Path(self.tmp.name) / "vectors.sqlite3"
-        self.env = patch.dict(os.environ, {"EMBEDDING_MODEL": "Qwen/Qwen3-Embedding-8B",
-            "EMBEDDING_ENDPOINT": "https://unit.inference.ml.azure.com/score",
+        self.env = patch.dict(os.environ, {"EMBEDDING_MODEL": "text-embedding-3-large",
+            "EMBEDDING_ENDPOINT": "https://unit.cognitiveservices.azure.com/openai/deployments/text-embedding-3-large/embeddings?api-version=2023-05-15",
             "EMBEDDING_DIMENSIONS": "2"}, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -118,23 +118,30 @@ class QwenEmbeddingTest(unittest.TestCase):
         return Mock(ok=True, status_code=200, json=Mock(return_value={
             "data": [{"index": 0, "embedding": [1.0] * dimensions}]}))
 
-    def test_documents_queries_and_cache_are_separate(self):
+    def test_documents_queries_are_unprefixed_and_reuse_cache(self):
         with patch("embedding_client.requests.post", return_value=self.response()) as post:
             client = EmbeddingClient(self.cache)
             client.embed_documents(["same words"])
-            self.assertEqual(post.call_args.args[0], "https://unit.inference.ml.azure.com/score")
+            self.assertEqual(post.call_args.args[0], "https://unit.cognitiveservices.azure.com/openai/deployments/text-embedding-3-large/embeddings?api-version=2023-05-15")
             self.assertEqual(post.call_args.kwargs["json"]["input"], ["same words"])
             client.embed_queries(["same words"])
             query = post.call_args.kwargs["json"]["input"][0]
-            self.assertTrue(query.startswith("Instruct: "))
-            self.assertTrue(query.endswith("\nQuery: same words"))
+            self.assertEqual(query, "same words")
             client.embed_queries(["same words"])
             client.embed_documents(["same words"])
-            self.assertEqual(post.call_count, 2)
+            self.assertEqual(post.call_count, 1)
             with patch.dict(os.environ, {"EMBEDDING_DIMENSIONS": "3"}):
                 post.return_value = self.response(3)
                 self.assertEqual(len(EmbeddingClient(self.cache).embed_documents(["same words"])[0]), 3)
-            self.assertEqual(post.call_count, 3)
+            self.assertEqual(post.call_count, 2)
+
+    def test_azure_api_key_header(self):
+        with patch.dict(os.environ, {"EMBEDDING_AUTH_MODE": "api_key",
+                "EMBEDDING_API_KEY_HEADER": "api-key", "EMBEDDING_API_KEY": "test-key"}), \
+                patch("embedding_client.requests.post", return_value=self.response()) as post:
+            EmbeddingClient(self.cache).embed_documents(["solar"])
+            self.assertEqual(post.call_args.kwargs["headers"]["api-key"], "test-key")
+            self.assertNotIn("Authorization", post.call_args.kwargs["headers"])
 
     def test_explicit_endpoint_never_inherits_unrelated_chat_key(self):
         with patch.dict(os.environ, {"OPENAI_API_KEY": "chat-secret"}), \

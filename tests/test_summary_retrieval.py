@@ -132,7 +132,7 @@ class SummaryRetrievalTest(unittest.TestCase):
         chunks = self.fake.calls[0]
         self.assertGreater(len(chunks), 1)
         self.assertIn('needle', chunks[-1])
-        tokenizer = TokenBudget('text-embedding-3-small')
+        tokenizer = TokenBudget('text-embedding-3-large')
         self.assertTrue(all(tokenizer.count(chunk) <= 6000 for chunk in chunks))
 
     def test_embedding_failure_is_explicit_and_bm25_remains_usable(self):

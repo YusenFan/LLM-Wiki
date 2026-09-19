@@ -95,7 +95,7 @@ class SummaryIndex:
         if self.embedder is None:
             raise RuntimeError("No embedding client configured")
         if self._chunks is None:
-            tokenizer = TokenBudget(getattr(self.embedder, "tokenizer_model", "text-embedding-3-small"))
+            tokenizer = TokenBudget(getattr(self.embedder, "tokenizer_model", "text-embedding-3-large"))
             chunk_tokens = getattr(self.embedder, "chunk_tokens", 6000)
             byte_limit = getattr(self.embedder, "max_input_bytes", 0)
             texts, owners = [], []

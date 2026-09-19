@@ -1,4 +1,4 @@
-"""Bounded live smoke: chat, JSON, tools, Qwen vectors/cache, and one synthetic Wiki QA.
+"""Bounded live smoke: chat, JSON, tools, Azure OpenAI vectors/cache, and one synthetic Wiki QA.
 
 No deployments are created and no benchmark datasets are read or evaluated.
 Source examples/azure-models.env.example after replacing its endpoint placeholders.
@@ -40,8 +40,7 @@ def preflight(scope="full"):
         require(mode in {"azure_cli", "api_key"}, f"Invalid {prefix}_AUTH_MODE")
         require(mode == "azure_cli" or bool(os.environ.get(key)), f"Configure {prefix} authentication")
     if scope == "full":
-        require(os.environ.get("EMBEDDING_QUERY_INSTRUCTION"), "Configure Qwen's query instruction explicitly")
-        require(os.environ.get("EMBEDDING_DIMENSIONS") == "4096", "Smoke expects full 4096-dimensional Qwen embeddings")
+        require(os.environ.get("EMBEDDING_DIMENSIONS") == "3072", "Smoke expects full 3072-dimensional text-embedding-3-large embeddings")
 
 
 def run_checks(root: Path, record, scope="full"):
@@ -89,7 +88,7 @@ def run_checks(root: Path, record, scope="full"):
     docs = ["Solar panels convert sunlight into electricity.", "Whales swim in the ocean."]
     vectors = embedder.embed_documents(docs)
     query = embedder.embed_queries(["How can sunlight generate electricity?"])[0]
-    require(len(vectors) == 2 and all(len(v) == 4096 for v in vectors + [query]), "Embedding dimension mismatch")
+    require(len(vectors) == 2 and all(len(v) == 3072 for v in vectors + [query]), "Embedding dimension mismatch")
     scores = [sum(a * b for a, b in zip(query, doc)) for doc in vectors]
     require(scores[0] > scores[1], "Relevant passage did not outrank unrelated passage")
     requests_before = embedder.stats["requests"]

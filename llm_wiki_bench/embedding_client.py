@@ -26,7 +26,7 @@ def unit_vector(value) -> list[float]:
 
 class EmbeddingClient:
     def __init__(self, cache_path: Path, model: str | None = None):
-        self.model = model or os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
+        self.model = model or os.environ.get("EMBEDDING_MODEL", "text-embedding-3-large")
         chat_base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
         self.base_url = os.environ.get("EMBEDDING_BASE_URL", chat_base).rstrip("/")
         self.protocol = os.environ.get("EMBEDDING_PROTOCOL", "openai")
@@ -42,11 +42,9 @@ class EmbeddingClient:
         self.batch_size = int(os.environ.get("EMBEDDING_BATCH_SIZE", "16"))
         self.timeout = int(os.environ.get("EMBEDDING_TIMEOUT", "45"))
         self.chunk_tokens = int(os.environ.get("EMBEDDING_CHUNK_TOKENS", "6000"))
-        self.tokenizer_model = os.environ.get("EMBEDDING_TOKENIZER_MODEL", "text-embedding-3-small")
-        is_qwen = "qwen" in self.model.lower()
-        self.max_input_bytes = int(os.environ.get("EMBEDDING_MAX_INPUT_BYTES", "12000" if is_qwen else "0"))
-        self.query_instruction = os.environ.get("EMBEDDING_QUERY_INSTRUCTION",
-            "Given a question, retrieve relevant wiki summaries that help answer it." if is_qwen else "")
+        self.tokenizer_model = os.environ.get("EMBEDDING_TOKENIZER_MODEL", "text-embedding-3-large")
+        self.max_input_bytes = int(os.environ.get("EMBEDDING_MAX_INPUT_BYTES", "0"))
+        self.query_instruction = os.environ.get("EMBEDDING_QUERY_INSTRUCTION", "")
         if (self.batch_size < 1 or self.timeout < 1 or self.chunk_tokens < 1
                 or self.max_input_bytes < 0 or (self.dimensions is not None and self.dimensions < 1)):
             raise ValueError("Embedding sizes, dimensions and timeout must be positive")
