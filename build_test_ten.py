@@ -4,6 +4,7 @@ Run from the project root: python build_test_ten.py
 Export API settings before running; this script makes model API calls.
 """
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -17,13 +18,17 @@ from preprocess_bench import process_hotpotqa
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-dir", type=Path, default=ROOT / "wiki_output/hotpotqa/test-ten",
+                        help="Isolated run directory containing raw, data, wiki and build report.")
+    args = parser.parse_args()
     input_path = (
         ROOT / "llm_wiki_bench/datasets/hotpotqa/hotpot_dev_distractor_v1.json"
     )
     if not input_path.is_file():
         raise SystemExit(f"Dataset not found: {input_path}")
 
-    test_dir = ROOT / "wiki_output/hotpotqa/test-ten"
+    test_dir = args.output_dir.resolve()
     print("Preparing context articles for the first 10 HotpotQA questions...", flush=True)
     processed = process_hotpotqa(
         input_path=input_path,
