@@ -58,7 +58,7 @@ def main() -> None:
     parser.add_argument("--summary-token-budget", type=int, default=4000,
                         help="Max serialized tokens per summary_search/wiki_read response, 512-16000 (default 4000).")
     parser.add_argument("--embedding-model", default=None,
-                        help="Embedding model; defaults to EMBEDDING_MODEL or text-embedding-3-small.")
+                        help="Embedding model; defaults to EMBEDDING_MODEL or text-embedding-3-large.")
     parser.add_argument("--output", "-o", default=None,
                         help="Predictions output path (default: results/<dataset>/predictions.jsonl).")
     parser.add_argument("--evaluate", action="store_true",
