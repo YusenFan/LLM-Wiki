@@ -1,18 +1,24 @@
 # Wiki schema: article evidence and related-page summaries
 
-Knowledge facts retain links to their **processed articles**; QA may cite sufficiently
+Knowledge facts retain links to their **source digests**, which link to the original articles; QA may cite sufficiently
 explicit knowledge-page evidence directly and read articles for additional detail or verification:
 
 ```text
 summaries/ (navigation, tags, member knowledge pages)
     → knowledge pages (facts, explained Related Pages)
-        → sources/articles/ (direct article links)
+        → sources/digests/ (structured source summaries)
+            → sources/articles/ (Original links)
 ```
 
 ## Directories
 
-- `sources/articles/<sha256>.md`: byte-for-byte copies of processed articles.
-  The filename is the full content hash; changed text creates a different file.
+- `sources/articles/<source-title>.md`: title-based filenames and Markdown wrappers
+  containing `type: source`, `source_title`, a single H1 and the original article body.
+  Titles are sanitized and lowercased like main. Same-title different content uses
+  numeric suffixes (`-2`, `-3`) so earlier originals remain available.
+- `sources/digests/<source-title>.md`: Summary, Key Facts, Key Entities, Related Context
+  and Original sections, assembled from validated source-attributed model facts.
+  Each digest links to its corresponding original article and records its content version.
 - Knowledge directories declared in `page_types.yaml`: e.g. `entities/`,
   `concepts/`, `events/`, `relations/`.
 - `summaries/<readable-title>.md`: one level of high-level navigation summaries.
@@ -20,8 +26,9 @@ summaries/ (navigation, tags, member knowledge pages)
   from frontmatter, not filenames.
 - `_index.md` files and root `index.md`: deterministic navigation lists.
 
-`sources`, `summaries`, and `syntheses` are reserved names. No new digest pages
-are generated. Article evidence does not need a link to pre-article raw material.
+`sources`, `summaries`, and `syntheses` are reserved names. Source filenames and
+knowledge-page source links use readable titles. Internal content fingerprints
+remain for cache and evidence checks. Existing corpora are not automatically migrated.
 
 ## Knowledge pages
 
@@ -30,7 +37,7 @@ Python renders the page from a validated JSON proposal:
 ```markdown
 ---
 type: entities
-schema: article-evidence-v1
+schema: title-digest-v1
 aliases: [A]
 tags: [history]
 ---
@@ -41,7 +48,7 @@ tags: [history]
 
 ## Core Facts
 
-- Alpha founded Beta. [[sources/articles/<sha256>]]
+- Alpha founded Beta. [[sources/digests/alpha]]
 
 ## Related Pages
 
@@ -49,12 +56,13 @@ tags: [history]
 
 ## Related Sources
 
-- [[sources/articles/<sha256>]]
+- [[sources/digests/alpha]]
 ```
 
 Every fact has at least one article citation. Citation input includes only the
 `.md` article path. Python checks that it resolves to a nonempty archived article
-and that its content matches its hash. The model does not choose a fragment,
+without requiring a hash filename. Python renders digest links on knowledge pages
+and the original article link on each digest. The model does not choose a fragment,
 count line numbers, or reproduce a quote during knowledge-page generation.
 Python reads the actual article content; it never persists model-written quotes
 as source text. Existing line-range links remain readable for compatibility.
@@ -136,6 +144,7 @@ and regenerated summary indexes.
   Tree listings do not use relevance scores; summary ranking has no custom field bonuses.
 - `wiki_read(paths, offset?)` opens 1-10 pages within the same token budget,
   including evidence IDs and text for knowledge-page facts and descriptions.
+  Digests are readable navigation pages; follow their Original links to articles.
   A truncated text returns `next_offset`, a character offset into the Markdown body;
   continue with one path. For an article it returns the path
   and line count, prompting `source_read` rather than treating navigation as proof.
@@ -145,7 +154,7 @@ and regenerated summary indexes.
   through `finish_answer`, with `evidence_ids` in requirements and each evidence-chain hop.
   Python constructs citations from the question-local registry of delivered knowledge-page
   and article snapshots. The model does not write quotes, paths, versions or ranges.
-  Summaries, directories and relationship descriptions do not supply evidence IDs.
+  Summaries, source digests, directories and relationship descriptions do not supply evidence IDs.
 - Python verifies that citations lie inside read passages with matching versions
   and exact quotes. Invalid submissions return a tool error for correction within
   budget; failure to submit a validated answer leaves `unknown`.

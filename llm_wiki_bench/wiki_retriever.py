@@ -14,7 +14,7 @@ from embedding_client import EmbeddingClient
 from evidence_snapshots import decorate_article, decorate_page, page_units
 from summary_retrieval import SummaryIndex
 from token_budget import TokenBudget, dumps
-from wiki_documents import ARTICLE_PREFIX, parse_document, read_article, resolve_wiki_link, wiki_path
+from wiki_documents import ARTICLE_PREFIX, DIGEST_PREFIX, SOURCE_SCHEMA, parse_document, read_article, resolve_wiki_link, wiki_path
 
 _logger = logging.getLogger("llm_wiki.retriever")
 
@@ -38,6 +38,8 @@ class WikiPage:
     def layer(self) -> str:
         if self.rel_path.startswith(ARTICLE_PREFIX):
             return "articles"
+        if self.rel_path.startswith(DIGEST_PREFIX):
+            return "digests"
         return "summaries" if self.dir_name == "summaries" else "knowledge"
 
 
@@ -90,7 +92,11 @@ class WikiRetriever:
                 continue
             if ((rel.parts[0] == "sources" and not rel_str.startswith(ARTICLE_PREFIX))
                     or rel_str.startswith("syntheses/")):
-                continue
+                if not rel_str.startswith(DIGEST_PREFIX):
+                    continue
+                metadata, _ = parse_document(md.read_text(encoding='utf-8'))
+                if md.name != '_index.md' and metadata.get('schema') != SOURCE_SCHEMA:
+                    continue
             if rel_str.startswith("summaries/"):
                 if md.name == "_index.md":
                     self.dir_indexes["summaries"] = "# Summaries\n" + "\n".join(
@@ -397,7 +403,8 @@ WIKI_TOOL_SCHEMAS: list[dict] = [
             "name": "wiki_read",
             "description": (
                 "Read 1-10 pages within the configured token budget. Knowledge pages return evidence IDs for answers. "
-                "Summaries and directories are navigation only and have no evidence IDs. "
+                "Summaries, source digests and directories are navigation only and have no evidence IDs. "
+                "Read a source digest's Original link with source_read for article evidence. "
                 "Text may be truncated: continue a single path with next_offset (character offset into page body). "
                 "For a directory, prefer wiki_tree pagination."
             ),

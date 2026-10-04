@@ -22,7 +22,6 @@ __all__ = [
     "bench_ingest",
     "build_summaries",
     "wiki_documents",
-    "bench_error_book",
     "preprocess_bench",
     "download_datasets",
     "run",

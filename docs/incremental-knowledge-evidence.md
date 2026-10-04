@@ -9,7 +9,7 @@
 ```json
 {
   "text": "In 2010, Alpha moved to Berlin.",
-  "citations": [{ "article": "sources/articles/HASH.md" }],
+  "citations": [{ "article": "sources/articles/alpha.md" }],
   "change": {
     "relation": "temporal_update",
     "related_fact_ids": ["fact_ID_OF_EARLIER_RESIDENCE"],

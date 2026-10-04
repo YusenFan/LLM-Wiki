@@ -1,3 +1,5 @@
+> 2026-10-04 来源保存更新：原文恢复 main 的标题文件名和 Markdown 包装，同标题不同内容使用数字后缀。新知识页来源指向 `sources/digests/<source-title>`，digest 的 Original 再指向 `sources/articles/<source-title>`；digest 由已校验事实整理，不增加模型调用。内部缓存及证据版本仍使用内容指纹。现有输出未自动迁移，以下哈希命名、直接 article 链接和取消 digest 的表格是历史记录。当前格式见 [Wiki schema](../configs/wiki-schema.md)。
+
 > 2026-09-17 摘要检索更新：默认入口为 summary 层 BM25 + dense + RRF，正文按 token 预算加载，可在同一 QA 循环补查；目录工具继续保留。见 [摘要混合检索](summary-hybrid-retrieval.md)。旧字段加权和哈希匹配未恢复；以下搜索相关表格属于历史实现记录。
 
 > 2026-09-17 QA 更新：检索、证据缺口状态和答案提交已合并到同一对话；知识页信息充分时直接作答，原文读取改为补充和核验入口。当前引用协议、预算和测试见 [统一 QA 循环](qa-agent-loop.md)。下文的强制原文引用规则及独立 `_answer()` 阶段属于历史实现；`validate_answer()` 已移动到 `qa_contract.py`。构建与摘要部分不受此次更新影响。
@@ -149,7 +151,7 @@ LLM 仍决定哪些事实相关、事实措辞、关系含义、摘要表达与�
 
 旧流程包含自由 Markdown 输出后的大量补救：补 digest 章节、按名称猜原文、强凑关联、再让模型修知识页。新流程在写入前验证结构化提议，失败保留错误供重试，因此不保留这些互相冲突的第二条写入路径。
 
-**同时退出默认 ingestion 的旧行为**包括 Error Book 自动改写、模型自动合并/移动目录、alias 合并、自动全局 overview、矛盾扫描与补写章节。这些不是“仍在暗中运行”。`bench_error_book.py` 文件保留，但新的 ingestion 不调用。此次没有实现替代性的自动纠错/目录治理服务。下表逐个列出原入口及去向，方便你决定是否需要单独恢复某项功能。
+**同时退出默认 ingestion 的旧行为**包括 Error Book 自动改写、模型自动合并/移动目录、alias 合并、自动全局 overview、矛盾扫描与补写章节。这些不是“仍在暗中运行”。Error Book 模块已删除。此次没有实现替代性的自动纠错/目录治理服务。下表逐个列出原入口及去向，方便你决定是否需要单独恢复某项功能。
 
 删除前版本是任务开始时的 `HEAD`（`d0fd9f4`）；可以用 `git show d0fd9f4:llm_wiki_bench/bench_ingest.py` 对照原代码。
 

@@ -35,7 +35,7 @@ summaries/ed-wood-and-ed-wood-film.md — Ed Wood and Ed Wood (film)
 
 摘要生成后从 title 生成安全、长度受限的可读文件名。重名的不同成员组使用 `-2`、`-3` 等后缀。成员组身份由 frontmatter 中的 members 确定，缓存新鲜度由 fingerprint 校验；哈希仍可用作内容校验值，但不再作为摘要文件名或匹配信号。
 
-原文归档仍保留 `sources/articles/<content-hash>.md` 文件名及内容版本校验，以保留已有证据链接。目录工具在原文路径旁显示真实标题。此次没有迁移原文文件或改动其内容。
+原文按 main 的标题规则保存为 `sources/articles/<source-title>.md`，重新包装 source frontmatter 和 H1。同标题不同内容用数字后缀保留。知识页链接到 `sources/digests/<source-title>`，digest 的 Original 再链接原文。新 digest 可通过 tree/read 导航，但不提供证据 ID；内部内容版本校验仍保留。现有 Wiki 输出不会自动迁移。
 
 ## 已有摘要离线迁移
 

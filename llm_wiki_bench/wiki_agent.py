@@ -32,7 +32,9 @@ _AGENT_SYSTEM_PROMPT_TEMPLATE = """You are a Wiki QA agent. Answer from knowledg
   If there are no suitable summaries (including isolated knowledge pages), use wiki_tree and read directly.
 - wiki_tree(path?, depth?, offset?, limit?) lists directories/files without relevance scores. Expand a directory
   or continue with next_offset when needed. The tree is the current Wiki filesystem view, not Git history.
-- wiki_read(paths, offset?) reads chosen summaries or knowledge pages within a token budget.
+- wiki_read(paths, offset?) reads chosen summaries, digests or knowledge pages within a token budget.
+  Knowledge-page source links lead to sources/digests/. Read the digest, then follow its Original
+  link to sources/articles/ and use source_read when original evidence is needed.
   Text may be truncated: use next_offset with a SINGLE path to continue the page body. An excerpt starting
   at start_offset > 0 omits earlier content; read offset=0 if needed. Read member links omitted from a
   summary preview by opening that summary. Knowledge-page facts can directly support your answer.
@@ -42,7 +44,7 @@ _AGENT_SYSTEM_PROMPT_TEMPLATE = """You are a Wiki QA agent. Answer from knowledg
 - Known entities may go straight to knowledge pages or articles. Isolated pages remain visible in the tree.
 
 ## Evidence contract
-Summaries and directory listings are navigation only. Read knowledge pages for EVERY hop or compared entity.
+Summaries, source digests and directory listings are navigation only. Read knowledge pages for EVERY hop or compared entity.
 If their facts explicitly answer the question with matching entities, time and conditions, submit directly;
 source_read is NOT required. You may also use original articles directly. Never fill gaps using your own knowledge.
 After each read, check unresolved parts of the question and continue as needed. If evidence is missing,

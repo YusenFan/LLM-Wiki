@@ -84,6 +84,7 @@ INGEST_CONTRADICTION_EVERY = 9999
 FIXED_DIRS = {
     "sources":          {"description": "Processed article evidence"},
     "sources/articles": {"description": "Article archive — original source paragraph texts"},
+    "sources/digests":  {"description": "Source digests with links to original articles"},
     "summaries":        {"description": "High-level summaries grouped by Related Pages"},
 }
 
@@ -281,7 +282,7 @@ def get_dir_catalog_text() -> str:
                 count = sum(
                     len([f for f in (WIKI_DIR / "sources" / sub).glob("*.md")
                          if f.name != "_index.md"])
-                    for sub in ("articles",)
+                    for sub in ("articles", "digests")
                     if (WIKI_DIR / "sources" / sub).exists()
                 )
             else:

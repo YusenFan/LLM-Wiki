@@ -16,8 +16,8 @@
 位置：`wiki_documents.article_reference`、`render_knowledge`，以及 ingestion 的生成提示、文章上下文、缓存和旧引用读取。
 
 - 为什么：此前让模型在 JSON 中逐字重抄文章整行；HotpotQA 一行往往包含多句话和双空格，正确的内容摘录也会导致整批失败。这不是建立 article 来源链所必需的步骤。
-- 怎么做：模型只给 `{"article": "sources/articles/<hash>.md"}`。Python 验证文件存在、位于 articles 目录、内容哈希一致且非空，直接读取其全文。
-- 知识页持久化 `[[sources/articles/<hash>]]`。不要求 quote、行号或证据片段 ID；模型额外返回的 quote 不作为原文保存或认证。
+- 怎么做：模型只给 `{"article": "sources/articles/<source-title>.md"}`。Python 验证文件存在、位于 articles 目录、内容非空；内部内容版本用于 receipt 和已读引用校验，直接读取其全文。
+- 知识页持久化 `[[sources/digests/<source-title>]]`，digest 的 Original 链接再指向原文。不要求 quote、行号或证据片段 ID；模型额外返回的 quote 不作为原文保存或认证。
 - 生成仍只能引用本次实际提供的 article；每个输入 article 仍须被本批至少一个事实引用。
 - 兼容：已有带 `#Lx-Ly` 的引用仍能被缓存和旧来源读取识别。QA 现有的显式行范围读取函数仍保留，但构建不调用逐字 quote 校验。
 - 边界：链接有效不等于原文在语义上支持事实，程序不作这种保证。

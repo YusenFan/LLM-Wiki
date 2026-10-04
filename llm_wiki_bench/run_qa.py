@@ -28,7 +28,6 @@ if str(_BENCH_DIR) not in sys.path:
 import bench_config as config                        # noqa: E402
 import evaluate as _evaluate                         # noqa: E402
 from llm_client import call_llm_with_tools  # noqa: E402
-from qa_contract import validate_answer               # noqa: E402
 from wiki_agent import WikiAgent                     # noqa: E402
 from wiki_retriever import WikiRetriever             # noqa: E402
 
@@ -145,19 +144,8 @@ def main() -> None:
                 "gold_answer": qa.get("answer", ""),
                 "retrieved_titles": [name for _, name in (rr.pages if rr else [])],
                 "retrieval_trace": rr.trace if rr else [],
-                "retrieval_steps": rr.total_calls if rr else 0,
-                "article_evidence": rr.evidence if rr else [],
-                "knowledge_evidence": rr.page_evidence if rr else [],
-                "evidence_snapshots": rr.evidence_registry if rr else {},
-                "retrieval_llm_calls": rr.llm_calls if rr else 0,
-                "retrieval_usage_by_model": rr.usage_by_model if rr else {},
-                "evidence_requirements": rr.requirements if rr else [],
-                "evidence_gaps": [item for item in rr.requirements if item["status"] == "unresolved"] if rr else [],
                 "stop_reason": rr.stop_reason if rr else "error",
                 "tool_calls": rr.tool_calls if rr else [],
-                "initial_navigation": rr.initial_navigation if rr else {},
-                "summary_searches": rr.summary_searches if rr else [],
-                "embedding_usage": rr.embedding_usage if rr else {},
                 "elapsed_seconds": round(time.time() - question_started, 3),
                 "retrieval_config": {"summary_mode": args.summary_mode, "summary_limit": args.summary_limit,
                                      "summary_candidates": args.summary_candidates,
@@ -170,7 +158,7 @@ def main() -> None:
 
             if i % 10 == 0 or i == len(qa_pairs) or args.verbose:
                 elapsed = time.time() - t0
-                print(f"  [{i}/{len(qa_pairs)}] {qa['id']}  steps={record['retrieval_steps']}  "
+                print(f"  [{i}/{len(qa_pairs)}] {qa['id']}  steps={len(record['tool_calls'])}  "
                       f"pages={len(record['retrieved_titles'])}  ({elapsed:.1f}s)")
 
     print(f"\nPredictions saved: {out_path}")

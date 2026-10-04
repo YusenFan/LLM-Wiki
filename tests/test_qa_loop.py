@@ -35,8 +35,8 @@ class QALoopTest(unittest.TestCase):
         source = self.base / 'input.md'
         source.write_text('Alpha founded Beta.\nBeta is in Paris.\n')
         self.article = archive_article(self.root, source)['article']
-        self.first = read_article(self.root, self.article, 1, 1)
-        self.second = read_article(self.root, self.article, 2, 2)
+        self.first = read_article(self.root, self.article, 8, 8)
+        self.second = read_article(self.root, self.article, 9, 9)
         self.retriever = WikiRetriever(self.root)
 
     def req(self, rid, citation=None):
@@ -58,7 +58,7 @@ class QALoopTest(unittest.TestCase):
             {'requirement_id': rid, 'claim': cit['quote'], 'evidence_ids': [self.reference_id(cit)]} for rid, cit in citations])
 
     def read(self, start, end=None):
-        return call('source_read', article=self.article, start_line=start, end_line=end or start)
+        return call('source_read', article=self.article, start_line=start + 7, end_line=(end or start) + 7)
 
     def run_script(self, replies, budget=12):
         snapshots = []
@@ -265,10 +265,9 @@ class QALoopTest(unittest.TestCase):
             run_qa.main()
         saved = json.loads(output.read_text())
         self.assertEqual(saved['prediction'], 'Paris')
-        self.assertEqual(saved['evidence_gaps'], result.requirements)
+        self.assertEqual(saved['tool_calls'], result.tool_calls)
         self.assertEqual(saved['stop_reason'], 'submitted')
-        self.assertEqual(saved['knowledge_evidence'], result.page_evidence)
-        self.assertEqual(saved['article_evidence'], [])
+        self.assertIsNone(saved['error'])
 
 
 if __name__ == '__main__':

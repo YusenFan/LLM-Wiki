@@ -14,7 +14,7 @@ from evidence_snapshots import decorate_page, page_units, register_page
 from knowledge_updates import fact_catalog, merge_knowledge
 from qa_contract import validate_answer
 from token_budget import dumps
-from wiki_documents import archive_article, parse_document, render_knowledge
+from wiki_documents import archive_article, parse_document, render_digests, render_knowledge, digest_path
 from wiki_retriever import WikiRetriever
 
 
@@ -35,6 +35,8 @@ class IncrementalEvidenceTest(unittest.TestCase):
         self.old = self.proposal('In 2000, Alpha lived in Paris.', self.old_article)
         self.old['related_pages'] = [{'path': 'entities/beta.md', 'reason': 'Shared biography'}]
         self.old_text = self.render(self.old)
+        for path, text in render_digests([self.old_article], [self.old]).items():
+            self.write(path, text)
         self.new = self.proposal('In 2010, Alpha moved to Berlin.', self.new_article)
         self.new['aliases'] = ['Later name']
         self.new['tags'] = ['later']
@@ -60,7 +62,7 @@ class IncrementalEvidenceTest(unittest.TestCase):
         merged = merge_knowledge(self.old_text, self.render(self.new), self.new)
         meta, body = parse_document(merged)
         for value in ('In 2000, Alpha lived in Paris.', 'In 2010, Alpha moved to Berlin.',
-                      self.old_article['article'][:-3], self.new_article['article'][:-3],
+                      digest_path(self.old_article['article'])[:-3], digest_path(self.new_article['article'])[:-3],
                       'entities/beta', 'Shared biography'):
             self.assertIn(value, body)
         self.assertEqual(meta['aliases'], ['Earlier name', 'Later name'])
@@ -91,7 +93,7 @@ class IncrementalEvidenceTest(unittest.TestCase):
             initial['related_pages'] = []
             with patch.object(bench_ingest, 'call_llm_json', return_value={'pages': [initial]}):
                 self.assertEqual(bench_ingest.ingest_batch([self.old_source])['success'], 1)
-            old_receipt = bench_ingest.load_cache()[self.old_article['version']]
+            old_receipt = bench_ingest.load_cache()[self.old_article['input_version']]
             with patch.object(bench_ingest, 'call_llm_json', side_effect=[
                     {'pages_to_view': [self.path]}, {'pages': [self.new]}]):
                 self.assertEqual(bench_ingest.ingest_batch([self.new_source])['success'], 1)
