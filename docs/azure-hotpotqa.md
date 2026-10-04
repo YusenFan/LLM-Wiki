@@ -12,8 +12,8 @@ VM provisioned using Azure CLI on 2026-09-18:
 The source snapshot excludes local credentials, Git history, previous outputs,
 and caches. The dataset contains exactly the first 100 entries from the local
 HotpotQA distractor development dataset, producing 991 distinct context articles.
-`build_test_hundred.py` passes all returned article paths to ingestion, then builds
-summaries. It does not run QA predictions or evaluation.
+`build_test_hundred.py` passes all returned article paths to ingestion, then rebuilds
+navigation indexes. It does not run QA predictions or evaluation.
 
 ## Add credentials and start
 
@@ -45,8 +45,8 @@ cat ~/LLM-Wiki/wiki_output/hotpotqa/first-100/build-result.json
 ```
 
 While building, the oneshot service appears as `activating`. A successful exit
-leaves it `active (exited)`; errors leave it `failed`. Check both article and
-summary failures in the report. Wiki files are under
+leaves it `active (exited)`; errors leave it `failed`. Check article failures in
+the report. Wiki files are under
 `~/LLM-Wiki/wiki_output/hotpotqa/first-100/wiki/`.
 
 Restart after fixing a failure with `sudo systemctl restart --no-block

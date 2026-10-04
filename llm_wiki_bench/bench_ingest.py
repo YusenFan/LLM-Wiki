@@ -265,17 +265,16 @@ def rebuild_indexes(root: Path) -> None:
         metadata, _ = parse_document(path.read_text(encoding='utf-8'))
         entries.append(f"- [[{directory}/{path.stem}]] — {metadata.get('source_title', path.stem)}")
     write_document(root / directory / '_index.md', f"# {directory}\n\n" + '\n'.join(entries) + '\n')
-    lines = ["# Wiki", "", "- [[summaries/_index]] — High-level navigation summaries",
-             "- [[sources/articles/_index]] — Original source articles"]
+    lines = ["# Wiki", "", "- [[sources/articles/_index]] — Original source articles"]
+    if (root / "summaries" / "_index.md").is_file():
+        lines.append("- [[summaries/_index]] — Existing navigation summaries")
     lines.extend(f"- [[{d}/_index]] — {len(entries)} knowledge pages" for d, entries in sorted(directories.items()))
     write_document(root / "index.md", "\n".join(lines) + "\n")
 
 
 def ingest_batch(article_paths: list[Path], batch_size: int = 5,
                  limit: int | None = None, force: bool = False) -> dict:
-    """Keep the public batch API; failures remain retryable and summaries run after ingestion."""
-    from build_summaries import build_summaries
-
+    """Ingest articles and rebuild navigation indexes; failures remain retryable."""
     if config.WIKI_DIR is None:
         raise ValueError("set a dataset before ingestion")
     if batch_size < 1 or (limit is not None and limit < 1):
@@ -321,9 +320,8 @@ def ingest_batch(article_paths: list[Path], batch_size: int = 5,
         process_batch(batch, allow_split=True)
         show_progress("Articles", stats["skipped"] + min(offset + batch_size, len(pending)),
                       len(paths), f"built={stats['success']} failed={stats['failed']} cached={stats['skipped']}")
-    print("Updating indexes and preparing summary groups...", flush=True)
+    print("Updating navigation indexes...", flush=True)
     rebuild_indexes(config.WIKI_DIR)
-    stats["summaries"] = build_summaries(config.WIKI_DIR)
     print(json.dumps(stats, ensure_ascii=False, indent=2))
     return stats
 
@@ -342,7 +340,7 @@ def main() -> None:
     if not paths:
         parser.error(f"no articles in {config.RAW_DIR}")
     stats = ingest_batch(paths, batch_size=args.batch_size, limit=args.limit, force=args.force)
-    raise SystemExit(1 if stats["failed"] or stats["summaries"]["failed"] else 0)
+    raise SystemExit(1 if stats["failed"] else 0)
 
 
 if __name__ == "__main__":

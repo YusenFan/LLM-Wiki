@@ -57,6 +57,6 @@ JSONL 保留既有 prediction、evidence_chain、article_evidence、evidence_req
 - `llm_wiki_bench/run_qa.py`：统一入口、模型参数和结果持久化。
 - `tests/test_tree_navigation.py`：树展开、分页、可读标题、摘要重名处理与旧文件迁移。
 - `tests/test_qa_loop.py`：缺口拒绝后补查、引用修复、完整需求覆盖、预算边界、多调用响应、停止行为和 runner 输出。
-- `tests/test_article_summary_workflow.py`：构建 → 摘要 → 原文 → 同循环提交的集成验证。
+- `tests/test_article_summary_workflow.py`：构建 → 无摘要目录导航 → 原文 → 同循环提交的集成验证。
 
 离线验证：`.venv/bin/python -m unittest discover -s tests -q`。这些测试使用脚本化模型响应，不代表真实模型 QA 准确率或成本改善。

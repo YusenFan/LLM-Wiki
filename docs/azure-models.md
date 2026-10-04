@@ -1,6 +1,6 @@
 # Azure GLM 5.2 Fast + text-embedding-3-large
 
-Ingestion, summaries, and QA use the existing GLM Chat Completions adapter.
+Ingestion and QA use the existing GLM Chat Completions adapter.
 Summary retrieval uses Azure OpenAI `text-embedding-3-large`. Knowledge-page
 reads and evidence validation continue through the existing Wiki agent.
 

@@ -38,7 +38,7 @@ def main() -> None:
     config.ensure_wiki_dirs()
     stats = ingest_batch(articles, batch_size=3)
     (output / "build-result.json").write_text(json.dumps(stats, indent=2) + "\n")
-    if stats["failed"] or stats["summaries"]["failed"]:
+    if stats["failed"]:
         raise SystemExit("Build has failures; inspect logs and build-result.json.")
     print(f"Build complete: {output / 'wiki'}", flush=True)
 

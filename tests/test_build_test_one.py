@@ -23,7 +23,7 @@ class TestBuildOne(unittest.TestCase):
             stale = root / 'wiki_output/hotpotqa/test-one/raw/articles/old-name.md'
             stale.parent.mkdir(parents=True)
             stale.write_text('Stale output from before the merge.')
-            stats = {'success': 10, 'failed': 0, 'summaries': {'failed': 0}}
+            stats = {'success': 10, 'failed': 0}
             with patch.object(build_test_one, 'ROOT', root), \
                  patch.object(build_test_one.config, 'set_dataset') as configure, \
                  patch.object(build_test_one.config, 'ensure_wiki_dirs') as initialize, \
@@ -47,7 +47,7 @@ class TestBuildOne(unittest.TestCase):
             dataset.parent.mkdir(parents=True)
             dataset.write_text(json.dumps([{'_id': 'one', 'question': 'Q?', 'answer': 'A',
                                            'context': [['Article', ['Article text.']]]}]))
-            stats = {'success': 0, 'failed': 1, 'summaries': {'failed': 0}}
+            stats = {'success': 0, 'failed': 1}
             with patch.object(build_test_one, 'ROOT', root), \
                  patch.object(build_test_one.config, 'set_dataset'), \
                  patch.object(build_test_one.config, 'ensure_wiki_dirs'), \

@@ -17,8 +17,8 @@ summaries/ (navigation, tags, member knowledge pages)
   numeric suffixes (`-2`, `-3`) so earlier originals remain available.
 - Knowledge directories declared in `page_types.yaml`: e.g. `entities/`,
   `concepts/`, `events/`, `relations/`.
-- `summaries/<readable-title>.md`: one level of high-level navigation summaries.
-  Duplicate titles use numeric suffixes; membership and freshness are checked
+- `summaries/<readable-title>.md`: existing high-level navigation summaries;
+  generation has been removed. Membership and freshness are checked
   from frontmatter, not filenames.
 - `_index.md` files and root `index.md`: deterministic navigation lists.
 
@@ -90,10 +90,10 @@ Articles, summaries, indexes and other links do not participate.
 5. Do not compute connected components or require a second topic classifier.
 
 Example: retain `{A,B,C}` and `{A,B,D}`; omit `{A,B}`. If only A and B link to
-each other, produce one `{A,B}` summary. Coverage by a union of several groups
+each other, accept an existing `{A,B}` summary. Coverage by a union of several groups
 is not sufficient to remove another group.
 An isolated `{C}` remains as a singleton group. Every knowledge page belongs to
-at least one group; actual summary coverage also requires those groups to build successfully.
+at least one group; existing summaries may cover only some groups.
 
 ## Summary pages
 
@@ -121,13 +121,11 @@ A high-level overview of the supplied knowledge pages.
 Navigation only. Read member knowledge pages for answers; consult original articles when needed.
 ```
 
-Python owns membership and deduplication. For groups of two or more pages, the LLM
-writes title, description, tags and overview. Singleton navigation pages are generated
-by Python from the member page, with no model call. `generation` metadata records
-`python-singleton-v1` or `llm-related`. A small fingerprint check avoids serving a cached summary
-when its membership or member contents have changed; no history/repair agent
-is introduced. Obsolete files may remain on disk but are excluded from retrieval
-and regenerated summary indexes.
+Summary generation and its CLI have been removed. `summary_catalog.py` checks
+existing pages against current member groups and content fingerprints without
+writing files. Existing `generation` metadata remains readable. Stale pages may
+remain on disk but are excluded from retrieval. New Wikis use directory navigation
+(`--summary-mode tree`) to reach knowledge pages and articles.
 
 ## QA contract
 

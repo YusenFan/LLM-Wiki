@@ -6,13 +6,13 @@
 
 `run_qa.main()` 配置 `WikiRetriever` → `WikiAgent.retrieve()` → `initial_navigation(question)` → `summary_search()` → `SummaryIndex.search()`。
 
-`WikiRetriever.load()` 使用 `current_summaries()` 排除成员或内容已变化的摘要。该 retriever 是一次 QA 进程的语料快照；修改 Wiki 后重启 QA 才会重新加载。只有 summary 进入搜索索引，knowledge/article 不会暗中加入候选。索引内容为摘要标题、正文和成员页面标题，移除 frontmatter、链接地址和长哈希；没有路径命中或字段加权奖励。
+`WikiRetriever.load()` 使用 `summary_catalog.current_summaries()` 排除成员或内容已变化的摘要。该 retriever 是一次 QA 进程的语料快照；修改 Wiki 后重启 QA 才会重新加载。只有 summary 进入搜索索引，knowledge/article 不会暗中加入候选。索引内容为摘要标题、正文和成员页面标题，移除 frontmatter、链接地址和长哈希；没有路径命中或字段加权奖励。
 
 BM25 使用完整词匹配、k1=1.5、b=0.75 和正 IDF；中文按字切分。Dense 调用 OpenAI-compatible `/embeddings`，按 cosine 排序。长摘要分成不超过 6000 个 cl100k_base tokens 的片段，各片段均参与 embedding，以最大片段相似度作为摘要相似度；不静默丢掉尾部。默认每路取 20 个文档候选，RRF 使用 `sum(1 / (60 + rank))` 融合，按路径确定性打破同分。BM25-only/dense-only 模式使用本路排名。
 
 返回排名不是置信度，更不代表事实支持关系。RRF 只用于选择阅读入口；最终答案引用 wiki_read 实际读过的知识页，或按需 source_read 读过的原文。摘要本身不作为最终证据。
 
-`build_summaries` 为没有进入任何多页分组的孤立知识页生成 singleton summary。Python 复制该页的导航正文、移除来源链接并添加 Member Pages 入口，不调用 LLM、不制造关系。singleton 与多页摘要都按成员内容 fingerprint 判断是否有效；新关系使 singleton 成为严格子集后，旧 singleton 不再进入 current summaries。完整成功构建时所有知识页均被覆盖；结果中的 `covered_pages` 和 `uncovered_pages` 可检测失败、限额或只生成 singleton 导致的缺口。已有 Wiki 可用 `--singletons-only` 离线补齐孤立页，命令见 [增量知识与证据 ID](incremental-knowledge-evidence.md)。
+summary page 的生成代码和 CLI 已移除，包括多页 LLM 摘要和 Python singleton 摘要。检索仍支持已有摘要：按成员集合和内容 fingerprint 校验，知识页变更后排除过期摘要，不自动刷新。新建 Wiki 没有摘要，使用 `--summary-mode tree` 通过目录浏览知识页和原文。
 
 ## 阅读预算和补查
 
@@ -54,7 +54,7 @@ python -m llm_wiki_bench.run_qa \
   --verbose
 ```
 
-若本机还没有 test-one Wiki，先运行已有 `python build_test_one.py`；这是调用模型的独立构建步骤。
+上述 hybrid 命令适用于已有有效摘要的 Wiki。`python build_test_one.py` 构建的新 Wiki 仅包含知识页和原文，QA 使用 `--summary-mode tree`。
 
 用 `--summary-mode bm25`、`dense` 或 `tree` 做对照。初始检索不占模型工具槽，后续检索、导航、状态更新和提交共享 `--t-max`；因此不能仅凭工具调用数比较不同入口的总成本。
 

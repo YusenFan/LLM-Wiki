@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import llm_wiki_bench
-from build_summaries import build_summaries
+from summary_fixtures import write_summary
 from embedding_client import EmbeddingClient
 from summary_retrieval import BM25, fuse
 from token_budget import TokenBudget, dumps
@@ -47,9 +47,10 @@ class SummaryRetrievalTest(unittest.TestCase):
         for i in range(len(bodies)):
             self.write(f'knowledge/a{i}.md', f'# Topic {i}\n\n## Related Pages\n- [[knowledge/b{i}]] — related\n')
             self.write(f'knowledge/b{i}.md', f'# Partner {i}\n\n## Related Pages\n- [[knowledge/a{i}]] — related\n')
-        proposals = [{'title': f'Topic {i} overview', 'description': 'An overview', 'tags': [], 'summary': body}
-                     for i, body in enumerate(bodies)]
-        build_summaries(self.root, generate=Mock(side_effect=proposals))
+        for i, body in enumerate(bodies):
+            write_summary(self.root, f'summaries/topic-{i}-overview.md',
+                          (f'knowledge/a{i}.md', f'knowledge/b{i}.md'),
+                          title=f'Topic {i} overview', body=body)
 
     def retriever(self, **kwargs):
         return WikiRetriever(self.root, embedder=self.fake, **kwargs)

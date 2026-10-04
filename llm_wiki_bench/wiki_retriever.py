@@ -9,7 +9,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
-from build_summaries import current_summaries
+from summary_catalog import current_summaries
 from embedding_client import EmbeddingClient
 from evidence_snapshots import decorate_article, decorate_page, page_units
 from summary_retrieval import SummaryIndex

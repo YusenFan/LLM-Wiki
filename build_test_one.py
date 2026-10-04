@@ -44,7 +44,7 @@ def main() -> None:
     report_path = test_dir / "build-result.json"
     report_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"Build report: {report_path}")
-    if stats["failed"] or stats["summaries"]["failed"]:
+    if stats["failed"]:
         raise SystemExit("构建存在失败，请先查看上面的错误。")
 
     print(f"构建完成：{test_dir / 'wiki'}")

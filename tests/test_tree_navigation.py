@@ -1,15 +1,13 @@
-"""Directory discovery and readable summary filenames, without any search ranking."""
-import hashlib
+"""Directory discovery and existing summary validation, without any search ranking."""
 import json
-import re
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
 
 import llm_wiki_bench
-from build_summaries import build_summaries, current_summaries, migrate_summary_names, summary_path
-from wiki_documents import archive_article, parse_document
+from summary_catalog import current_summaries
+from summary_fixtures import write_summary
+from wiki_documents import archive_article
 from wiki_retriever import WikiRetriever, WIKI_TOOL_SCHEMAS
 
 
@@ -28,10 +26,6 @@ class TreeNavigationTest(unittest.TestCase):
     def groups(self):
         for name, other in [('a', 'b'), ('b', 'a'), ('c', 'd'), ('d', 'c')]:
             self.write(f'film/{name}.md', f'# {name.upper()}\n\n## Related Pages\n- [[film/{other}]] — related\n')
-
-    def generate(self, title='Shared film history'):
-        return Mock(return_value={'title': title, 'description': 'Group overview',
-                                  'tags': [], 'summary': 'Related films and people.'})
 
     def test_tree_exposes_titles_and_nested_directories_without_index_files(self):
         self.write('film/ed_wood.md', '# Ed Wood\n\n> American filmmaker.\n')
@@ -77,57 +71,28 @@ class TreeNavigationTest(unittest.TestCase):
         self.assertEqual(entry['path'], article['article'])
         self.assertEqual(retriever.source_read(entry['path'])['version'], article['version'])
 
-    def test_readable_summary_names_handle_collisions_and_cache_by_membership(self):
+    def test_existing_summaries_exclude_stale_pages_without_writes(self):
         self.groups()
-        generated = self.generate()
-        self.assertEqual(build_summaries(self.root, generate=generated)['built'], 2)
-        self.assertEqual(set(current_summaries(self.root)), {
-            'summaries/shared-film-history.md', 'summaries/shared-film-history-2.md'})
-        no_calls = Mock(side_effect=AssertionError('must use cached summaries'))
-        self.assertEqual(build_summaries(self.root, generate=no_calls)['cached'], 2)
-        no_calls.assert_not_called()
+        for label, members in [('first', ('film/a.md', 'film/b.md')),
+                               ('second', ('film/c.md', 'film/d.md'))]:
+            write_summary(self.root, f'summaries/{label}.md', members, title='Shared film history')
+        self.assertEqual(set(current_summaries(self.root)),
+                         {'summaries/first.md', 'summaries/second.md'})
         self.write('film/a.md', '# A\n\n## Related Pages\n- [[film/b]] — related\nChanged.\n')
-        self.assertEqual(len(current_summaries(self.root)), 1)
+        before = {p: p.read_bytes() for p in self.root.rglob('*.md')}
+        self.assertEqual(set(current_summaries(self.root)), {'summaries/second.md'})
         retriever = WikiRetriever(self.root)
         self.assertEqual(sum(e.get('layer') == 'summaries' for e in retriever.tree()['entries']), 1)
+        self.assertEqual(before, {p: p.read_bytes() for p in self.root.rglob('*.md')})
 
-    def test_legacy_summary_migration_preserves_content_and_archives_originals(self):
+    def test_existing_legacy_summaries_prefer_readable_duplicate(self):
         self.groups()
-        build_summaries(self.root, generate=self.generate())
-        original = current_summaries(self.root)
-        legacy = {}
-        for relative, text in original.items():
-            members = parse_document(text)[0]['members']
-            digest = hashlib.sha256(json.dumps(members).encode()).hexdigest()
-            old = f'summaries/{digest}.md'
-            (self.root / relative).rename(self.root / old)
-            legacy[old] = text
-        self.write('summaries/' + 'f' * 64 + '.md', '# Obsolete\n')
-        self.assertEqual(len(current_summaries(self.root)), 2)
-        report = migrate_summary_names(self.root)
-        self.assertEqual(len(report['renamed']), 2)
-        self.assertEqual(len(report['archived_originals']), 3)
-        for old, new in report['renamed'].items():
-            self.assertEqual((self.root / new).read_text(), legacy[old])
-            self.assertFalse((self.root / old).exists())
-        for backup in report['archived_originals']:
-            self.assertTrue((self.root / backup).is_file())
-        self.assertEqual(len(current_summaries(self.root)), 2)
-        self.assertFalse(any(re.fullmatch(r'[0-9a-f]{64}', path.stem)
-                             for path in (self.root / 'summaries').glob('*.md')))
-        self.assertEqual(migrate_summary_names(self.root)['renamed'], {})
-        no_calls = Mock(side_effect=AssertionError('migration must preserve cache'))
-        self.assertEqual(build_summaries(self.root, generate=no_calls)['cached'], 2)
-        index = (self.root / 'summaries/_index.md').read_text()
-        self.assertIn('shared-film-history', index)
-
-    def test_summary_titles_produce_safe_short_paths_and_reserved_names_work(self):
-        for title in ['../A/B', '主题' * 100, 'index', 'overview', 'log', '???']:
-            with self.subTest(title=title):
-                path = Path(summary_path(('film/a.md', 'film/b.md'), title))
-                self.assertEqual(path.parent.as_posix(), 'summaries')
-                self.assertLess(len(path.name.encode()), 255)
-                self.assertNotIn(path.name, ['index.md', 'overview.md', 'log.md'])
+        legacy = 'summaries/' + 'a' * 64 + '.md'
+        content = write_summary(self.root, legacy, ('film/a.md', 'film/b.md'), title='Film history')
+        self.assertEqual(set(current_summaries(self.root)), {legacy})
+        self.write('summaries/film-history.md', content)
+        self.write('summaries/obsolete.md', '# Obsolete\n')
+        self.assertEqual(set(current_summaries(self.root)), {'summaries/film-history.md'})
 
 
 if __name__ == '__main__':

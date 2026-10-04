@@ -1,4 +1,4 @@
-"""Offline contracts for the article → knowledge → summary → QA workflow."""
+"""Offline contracts for the article → knowledge → QA workflow."""
 
 import copy
 import hashlib
@@ -11,7 +11,8 @@ from unittest.mock import Mock, patch
 import llm_wiki_bench  # establish the project's sibling-module import path
 import bench_config as config
 import bench_ingest
-from build_summaries import build_summaries, current_summaries, summary_groups, summary_path
+from summary_catalog import current_summaries, summary_groups
+from summary_fixtures import write_summary
 from qa_contract import validate_answer
 from wiki_agent import WikiAgent
 from evidence_snapshots import evidence_id
@@ -112,7 +113,6 @@ class WorkflowTest(unittest.TestCase):
             ('entities/a.md', 'entities/b.md', 'entities/d.md'), ('entities/solo.md',)])
         pair = {'entities/a.md': graph_page('entities/b.md'), 'entities/b.md': graph_page('entities/a.md')}
         self.assertEqual(summary_groups(pair), [('entities/a.md', 'entities/b.md')])
-        self.assertEqual(summary_path(tuple(pair)), summary_path(tuple(reversed(pair))))
 
     def test_union_coverage_does_not_remove_a_group(self):
         pages = {'x/a.md': graph_page('x/b.md', 'x/c.md'),
@@ -132,44 +132,28 @@ class WorkflowTest(unittest.TestCase):
         self.write('summaries/old.md', graph_page('entities/c.md'))
         self.assertEqual(summary_groups(knowledge_pages(self.root)), [('entities/a.md', 'entities/b.md'), ('entities/c.md',)])
 
-    def test_summaries_cache_failures_staleness_and_no_recursive_groups(self):
+    def test_existing_summary_freshness_and_no_recursive_groups(self):
         self.graph()
-        response = {'title': 'Shared history', 'description': 'Alpha connections',
-                    'tags': ['history, culture'], 'summary': 'An overview of the related pages.'}
-        generator = Mock(side_effect=[RuntimeError('temporary failure'), response])
-        stats = build_summaries(self.root, generate=generator)
-        self.assertEqual((stats['built'], stats['failed']), (2, 1))
-        retry = Mock(return_value=response)
-        stats = build_summaries(self.root, generate=retry)
-        self.assertEqual((stats['built'], stats['cached']), (1, 2))
-        self.assertEqual(retry.call_count, 1)
+        groups = summary_groups(knowledge_pages(self.root))
+        for i, members in enumerate(groups):
+            write_summary(self.root, f'summaries/group-{i}.md', members)
         self.assertEqual(len(current_summaries(self.root)), 3)
-        for text in current_summaries(self.root).values():
-            meta, body = parse_document(text)
-            if len(meta['members']) > 1:
-                self.assertEqual(meta['tags'], ['history, culture'])
-            for member in meta['members']:
-                self.assertIn(f'[[{member[:-3]}]]', body)
         self.write('entities/c.md', graph_page() + '\nChanged knowledge.')
         self.assertEqual(len(current_summaries(self.root)), 2)
         self.assertEqual(len(summary_groups(knowledge_pages(self.root))), 3)
         self.write('entities/a.md', graph_page())
         self.write('entities/b.md', graph_page())
-        self.assertEqual(len(current_summaries(self.root)), 1)  # Unchanged singleton remains current.
-
-    def test_summary_limit_leaves_retryable_pending(self):
-        self.graph()
-        generate = Mock(return_value={'title': 'Group', 'description': 'Overview', 'tags': [], 'summary': 'Text'})
-        stats = build_summaries(self.root, limit=1, generate=generate)
-        self.assertEqual((stats['built'], stats['pending']), (1, 2))
-        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(len(current_summaries(self.root)), 1)
 
     def test_ingest_success_cache_and_failed_output_never_cached(self):
         proposal = {'pages': [self.proposal()]}
         with self.config_patches(), patch.object(config, 'get_page_types', return_value={'entities': {}}):
-            with patch.object(bench_ingest, 'call_llm_json', return_value=proposal):
+            with patch.object(bench_ingest, 'call_llm_json', return_value=proposal) as generate:
                 stats = bench_ingest.ingest_batch([self.raw])
             self.assertEqual(stats['success'], 1)
+            generate.assert_called_once()
+            self.assertNotIn('summaries', stats)
+            self.assertFalse((self.root / 'summaries').exists())
             self.assertFalse((self.root / 'sources/digests').exists())
             index = (self.root / 'index.md').read_text()
             self.assertIn('[[sources/articles/_index]]', index)
@@ -177,10 +161,16 @@ class WorkflowTest(unittest.TestCase):
             cache = bench_ingest.load_cache()
             self.assertTrue(bench_ingest._cache_valid(cache[self.article['input_version']], self.root))
             self.assertFalse(bench_ingest._cache_valid({'status': 'ingested'}, self.root))
+            existing = write_summary(self.root, 'summaries/alpha.md', ('entities/alpha.md',))
+            self.write('summaries/_index.md', '# Existing summaries\n- [[summaries/alpha]]\n')
+            before = {p: p.read_bytes() for p in (self.root / 'summaries').glob('*.md')}
             with patch.object(bench_ingest, 'call_llm_json') as generate:
                 stats = bench_ingest.ingest_batch([self.raw])
                 generate.assert_not_called()
                 self.assertEqual(stats['skipped'], 1)
+            self.assertEqual(before, {p: p.read_bytes() for p in (self.root / 'summaries').glob('*.md')})
+            self.assertEqual(current_summaries(self.root), {'summaries/alpha.md': existing})
+            self.assertIn('[[summaries/_index]]', (self.root / 'index.md').read_text())
             self.write('entities/alpha.md', (self.root / 'entities/alpha.md').read_text() + '\nAdditional material.\n')
             self.assertTrue(bench_ingest._cache_valid(cache[self.article['input_version']], self.root))
             (self.root / 'entities/alpha.md').unlink()
@@ -444,25 +434,25 @@ class WorkflowTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_answer(proposal, [passage])
 
-    def test_complete_build_summary_navigation_and_answer(self):
+    def test_complete_build_tree_navigation_and_answer_without_summaries(self):
         first = self.proposal(related=[{'path': 'entities/beta.md', 'reason': 'founded by Alpha'}])
         second = self.proposal('entities/beta.md', [{'path': 'entities/alpha.md', 'reason': 'founder'}])
         second['title'] = 'Beta'
         second['facts'] = [{'text': 'Beta is in Paris.', 'citations': [
             read_article(self.root, self.article['article'], 9, 9)]}]
-        overview = {'title': 'Alpha and Beta', 'description': 'Founding and location',
-                    'tags': ['organizations'], 'summary': 'Alpha founded Beta, an organization in Paris.'}
         with self.config_patches(), patch.object(config, 'get_page_types', return_value={'entities': {}}):
-            with patch.object(bench_ingest, 'call_llm_json', return_value={'pages': [first, second]}) as generate, \
-                    patch('build_summaries.call_llm_json', return_value=overview):
+            with patch.object(bench_ingest, 'call_llm_json', return_value={'pages': [first, second]}) as generate:
                 stats = bench_ingest.ingest_batch([self.raw])
                 self.assertIn('entities/example.md', generate.call_args.args[0])
                 self.assertNotIn('concepts/topic.md', generate.call_args.args[0])
                 self.assertIn('Allowed page-type directories: ["entities"]', generate.call_args.args[0])
-        self.assertEqual(stats['summaries']['built'], 1)
+        self.assertEqual(stats['success'], 1)
+        self.assertNotIn('summaries', stats)
+        generate.assert_called_once()
+        self.assertFalse((self.root / 'summaries').exists())
+        self.assertNotIn('[[summaries/_index]]', (self.root / 'index.md').read_text())
         retriever = WikiRetriever(self.root)
-        summary = next(e['path'] for e in retriever.tree()['entries'] if e.get('layer') == 'summaries')
-        steps = [('wiki_read', {'paths': [summary]}),
+        steps = [('wiki_tree', {'path': 'entities'}),
                  ('wiki_read', {'paths': ['entities/alpha.md', 'entities/beta.md']}),
                  ('source_read', {'article': self.article['article'], 'start_line': 8, 'end_line': 9})]
         replies = [{'role': 'assistant', 'content': None, 'tool_calls': [

@@ -104,7 +104,7 @@ def step_ingest(dataset: str, batch_size: int = 3, force: bool = False,
     print(f"  📁 Wiki output: {config.WIKI_DIR}")
 
     stats = bench_ingest.ingest_batch(article_paths, batch_size=batch_size, force=force)
-    return stats["failed"] == 0 and stats["summaries"]["failed"] == 0
+    return stats["failed"] == 0
 
 
 def run_one(dataset: str, args) -> bool:

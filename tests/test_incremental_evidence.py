@@ -1,15 +1,16 @@
-"""Regression contracts for retained history, singleton navigation and snapshot IDs."""
+"""Regression contracts for retained history, existing singleton navigation and snapshot IDs."""
 import copy
 import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import llm_wiki_bench
 import bench_config as config
 import bench_ingest
-from build_summaries import build_summaries, current_summaries
+from summary_catalog import current_summaries
+from summary_fixtures import write_summary
 from evidence_snapshots import decorate_page, page_units, register_page
 from knowledge_updates import fact_catalog, merge_knowledge
 from qa_contract import validate_answer
@@ -100,33 +101,27 @@ class IncrementalEvidenceTest(unittest.TestCase):
             self.assertIn(self.old['facts'][0]['text'], content)
             self.assertIn(self.new['facts'][0]['text'], content)
 
-    def test_singletons_cover_all_pages_without_model_and_refresh_after_updates(self):
+    def test_existing_singletons_become_stale_after_updates(self):
         self.write(self.path, self.render({**self.old, 'related_pages': []}))
         self.write('entities/solo.md', '# Solo\n\nA rare navigation keyword: zephyr.\n')
-        generate = Mock(side_effect=AssertionError('singleton must not call model'))
-        stats = build_summaries(self.root, generate=generate, singletons_only=True)
-        self.assertEqual((stats['singleton_built'], stats['covered_pages'], stats['uncovered_pages']), (2, 2, []))
-        self.assertEqual(build_summaries(self.root, generate=generate)['cached'], 2)
+        write_summary(self.root, 'summaries/alpha.md', (self.path,))
+        original = write_summary(self.root, 'summaries/solo.md', ('entities/solo.md',))
+        self.assertEqual(len(current_summaries(self.root)), 2)
         self.write('entities/solo.md', '# Solo\n\nUpdated zephyr.\n')
-        self.assertEqual(len(current_summaries(self.root)), 1)
-        self.assertEqual(build_summaries(self.root, generate=generate)['singleton_built'], 1)
-        self.assertTrue(any('Updated zephyr.' in text for text in current_summaries(self.root).values()))
-        generate.assert_not_called()
+        self.assertEqual(set(current_summaries(self.root)), {'summaries/alpha.md'})
+        self.assertEqual((self.root / 'summaries/solo.md').read_text(), original)
 
-    def test_singleton_becoming_linked_is_replaced_in_current_navigation(self):
+    def test_existing_singleton_becoming_linked_is_excluded(self):
         self.write(self.path, '# Alpha\n\nAlpha fact.\n')
         self.write('entities/beta.md', '# Beta\n\nBeta fact.\n')
-        build_summaries(self.root, singletons_only=True)
+        write_summary(self.root, 'summaries/alpha.md', (self.path,))
+        write_summary(self.root, 'summaries/beta.md', ('entities/beta.md',))
         self.write(self.path, self.old_text)
         self.assertEqual(current_summaries(self.root), {})
-        stats = build_summaries(self.root, generate=Mock(return_value={
-            'title': 'Pair', 'description': 'Pair navigation', 'tags': [], 'summary': 'Alpha and Beta.'}))
-        self.assertEqual((stats['built'], stats['covered_pages']), (1, 2))
-        self.assertEqual(len(current_summaries(self.root)), 1)
 
     def test_singleton_read_is_navigation_without_evidence_ids(self):
         self.write(self.path, '# Alpha\n\nAlpha fact.\n')
-        build_summaries(self.root, singletons_only=True)
+        write_summary(self.root, 'summaries/alpha.md', (self.path,))
         path = next(iter(current_summaries(self.root)))
         retriever = WikiRetriever(self.root, summary_mode='bm25')
         result = json.loads(retriever.execute_tool('summary_search', {'query': 'Alpha'}))

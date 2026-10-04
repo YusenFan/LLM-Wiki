@@ -1,4 +1,4 @@
-# 增量知识、singleton 导航与证据 ID
+# 增量知识、已有摘要与证据 ID
 
 ## 保留旧知识
 
@@ -25,20 +25,10 @@
 
 这项修改保护后续更新，不会自动找回此前已经被覆盖的事实。历史缺失需要从不可变原文存档重新入库；如果旧 receipt 仍有效却遗漏部分事实，需单独检查或有针对性重建。
 
-## Singleton summary
+## 已有 summary
 
-分组仍是每页与显式 Related Pages 的集合，去重并删除严格子集。保留剩下的单页组，使所有知识页都属于至少一个组。单页摘要由 Python 生成，不调用模型；多页组沿用原来的 LLM 摘要。
-
-只补齐已有 Wiki 的孤立页面：
-
-```bash
-source .venv/bin/activate
-python -m llm_wiki_bench.build_summaries \
-  --wiki-dir wiki_output/hotpotqa/test-ten/wiki \
-  --singletons-only
-```
-
-该命令无需加载 API 凭证。它保留有效多页摘要，报告尚未构建的多页组为 pending。检查 `covered_pages == knowledge_pages` 且 `uncovered_pages == []` 才能断言本次 Wiki 覆盖完整。只有完整构建成功且无限额时才能保证覆盖全部知识页。知识页修改后重建 summaries，再启动新的 QA 进程加载新快照。
+summary page 生成代码及独立 CLI 已移除。构建只归档原文、更新知识页和导航索引。
+已有 singleton 和多页摘要仍按当前成员集合及内容 fingerprint 校验；知识页或关系变化后，过期摘要被排除，不会自动刷新或删除。新 Wiki 使用 `--summary-mode tree` 浏览知识页和原文。
 
 ## 模型选证据，Python 生成引用
 
@@ -56,4 +46,4 @@ python -m llm_wiki_bench.build_summaries \
 .venv/bin/python -m unittest discover -s tests -q
 ```
 
-`tests/test_incremental_evidence.py` 覆盖旧知识保留、时间关联、receipt 有效性、singleton 无模型生成与失效切换、非连续事实、快照版本及未读证据拒绝；QA loop 测试覆盖实际工具提交和截断续读。
+`tests/test_incremental_evidence.py` 覆盖旧知识保留、时间关联、receipt 有效性、已有 singleton 的失效切换、非连续事实、快照版本及未读证据拒绝；QA loop 测试覆盖实际工具提交和截断续读。

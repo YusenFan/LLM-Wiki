@@ -1,3 +1,5 @@
+> 2026-10-05 摘要生成移除：`build_summaries.py`、多页 LLM 摘要、Python singleton 及相关 CLI 已删除。已有摘要的只读校验移至 `summary_catalog.py`；新 Wiki 使用 `--summary-mode tree`。以下是历史实施记录，生成函数和旧命令不适用于当前代码。
+
 > 2026-10-05 来源保存更新：知识页直接链接到 `sources/articles/<source-title>`，不再生成、索引或读取 digest 页。原文保留标题文件名和 Markdown 包装，同标题不同内容使用数字后缀。内部缓存及证据版本仍使用内容指纹，构建回执 schema 更新为 `title-article-v1`。现有输出未自动迁移，需在新目录重建以更新来源链接。下文为历史实施记录，当前格式见 [Wiki schema](../configs/wiki-schema.md)。
 
 > 2026-09-17 摘要检索更新：默认入口为 summary 层 BM25 + dense + RRF，正文按 token 预算加载，可在同一 QA 循环补查；目录工具继续保留。见 [摘要混合检索](summary-hybrid-retrieval.md)。旧字段加权和哈希匹配未恢复；以下搜索相关表格属于历史实现记录。
@@ -257,16 +259,8 @@ QA 侧还删除 `_format_context`、`_extract_clean_answer`：不再把全部导
 .venv/bin/python -m llm_wiki_bench.bench_ingest --dataset hotpotqa --limit 20 \
   --wiki-dir wiki_output/hotpotqa/article-evidence/wiki
 
-# 只看集合，无模型调用、无写入
-.venv/bin/python -m llm_wiki_bench.build_summaries \
-  --wiki-dir wiki_output/hotpotqa/article-evidence/wiki --dry-run
-
-# 独立续跑摘要
-.venv/bin/python -m llm_wiki_bench.build_summaries \
-  --wiki-dir wiki_output/hotpotqa/article-evidence/wiki --limit 10
-
 # 对独立 wiki 做 QA；输出另存，1 是问题数量
-.venv/bin/python -m llm_wiki_bench.run_qa --dataset hotpotqa --limit 1 \
+.venv/bin/python -m llm_wiki_bench.run_qa --dataset hotpotqa --limit 1 --summary-mode tree \
   --wiki-dir wiki_output/hotpotqa/article-evidence/wiki \
   --output results/hotpotqa/article-evidence-smoke.jsonl
 ```

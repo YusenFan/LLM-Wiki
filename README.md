@@ -6,11 +6,11 @@ Azure GLM 5.2 Fast and text-embedding-3-large setup and bounded smoke test:
 LLM-Wiki turns documents into a persistent, linked knowledge base and answers
 questions using evidence read from that knowledge base. It separates **offline
 knowledge construction** from **online question answering**: articles are archived,
-facts accumulate on knowledge pages, and summaries help a single QA agent find the
-pages it needs.
+facts accumulate on knowledge pages, and a single QA agent finds pages through
+directory navigation or existing summaries.
 
 The model proposes facts, relationships, and answers. Python manages storage,
-preserves earlier knowledge, builds navigation groups, and validates citations
+preserves earlier knowledge, rebuilds navigation indexes, and validates citations
 against the text actually delivered to the agent.
 
 ## Architecture
@@ -24,8 +24,6 @@ flowchart TD
         Proposals --> Validate[Python validation and incremental merge]
         Validate --> Knowledge[Knowledge pages with facts and article links]
         Knowledge --> Articles
-        Knowledge --> Groups[Python groups explicit Related Pages]
-        Groups --> Summaries[LLM group summaries or Python singleton summaries]
     end
     subgraph QA[Online question answering]
         Question[Question] --> Search[Summary BM25 and dense search with RRF]
@@ -38,7 +36,7 @@ flowchart TD
         Check -->|Rejected within budget| Agent
         Check -->|Accepted| Answer[Answer with citations or explicit unknown]
     end
-    Summaries --> Search
+    Summaries[Existing navigation summaries] --> Search
     Knowledge --> Read
     Articles --> Read
 ```
@@ -49,7 +47,7 @@ flowchart TD
 | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------- |
 | Articles        | Title-based Markdown originals under `sources/articles/<source-title>.md`; numeric suffixes preserve same-title different content. | Optional source passages for additional detail, ambiguity, conflicts, or verification. |
 | Knowledge pages | Entity, concept, event, or other configured pages containing facts, article links, explained relationships, and update records.                  | Read facts can directly support an answer.                                             |
-| Summaries       | One level of navigation summaries with explicit member-page links and content fingerprints.                                                      | Retrieval entry points; summaries cannot serve as final answer evidence.               |
+| Summaries       | Existing navigation summaries with explicit member-page links and content fingerprints; no longer generated.                                                      | Retrieval entry points; summaries cannot serve as final answer evidence.               |
 
 The Wiki uses Markdown and YAML frontmatter on disk. Summary embeddings are
 cached in SQLite and searched locally; no vector database is required.
@@ -118,25 +116,16 @@ Alpha lived in Paris in 2000. The new fact can link to the earlier fact as a
 and add an explanation. QA must use the dates and conditions relevant to the
 question.
 
-### 4. Build summary navigation
+### 4. Read existing summary navigation
 
-After ingestion, Python forms each candidate group from a knowledge page plus
-its explicit Related Pages targets. It deduplicates identical groups and removes
-strict subsets of another group. Overlapping groups remain separate; they are
-not merged into connected components.
+Summary-page generation has been removed, including LLM group summaries and
+Python singleton summaries. Builds archive articles, update knowledge pages, and
+rebuild navigation indexes.
 
-For example, `{A, B, C}` and `{A, B, D}` both remain, while `{A, B}` is removed.
-An isolated page remains a singleton group.
-
-For groups with multiple pages, the LLM writes a title, description, tags, and
-overview. Python creates singleton summaries directly from their member page
-without a model call. Python owns group membership and member links in both cases.
-
-Each summary stores a fingerprint of its members and their content. Retrieval
-excludes summaries whose groups or member content have changed. Rebuild summaries
-after updating knowledge pages, then start a new QA process to load the new
-snapshot. Complete coverage requires a successful build of all groups; check
-`covered_pages` and `uncovered_pages` in the summary report.
+Existing summaries remain readable. `summary_catalog.current_summaries()` checks
+their member groups and content fingerprints and excludes stale summaries.
+It does not generate, refresh, rename, or delete pages. New Wikis have no summary
+pages; use directory navigation with `--summary-mode tree` for those corpora.
 
 ### 5. Retrieve, read, and answer in one agent loop
 
@@ -201,8 +190,8 @@ export EMBEDDING_MODEL="text-embedding-3-large"
 ```
 
 The client uses an OpenAI-compatible HTTP API. The fast model selects existing
-pages during ingestion; the premium model generates knowledge pages and multi-page
-summaries and is the default for the entire QA loop. QA requires tool calling.
+pages during ingestion; the premium model generates knowledge pages
+and is the default for the entire QA loop. QA requires tool calling.
 The model names above are the defaults in the code and can be overridden for
 your endpoint.
 
@@ -233,13 +222,14 @@ python -m llm_wiki_bench.run \
 python -m llm_wiki_bench.run_qa \
   --dataset hotpotqa --limit 10 \
   --wiki-dir wiki_output/hotpotqa/demo/wiki \
+  --summary-mode tree \
   --output results/hotpotqa/demo-predictions.jsonl \
   --evaluate --verbose
 ```
 
 The build downloads the dataset, preprocesses articles and QA records, ingests
-articles, and builds summaries. Construction and QA make model API calls; hybrid
-retrieval also calls the embedding API for uncached text.
+articles, and rebuilds navigation indexes. Construction and QA make model API
+calls; hybrid retrieval also calls the embedding API for uncached text.
 
 `run --limit` limits preprocessed questions, `bench_ingest --limit` limits articles,
 and `run_qa --limit` limits answered questions. The normal build reads all files
@@ -260,14 +250,6 @@ python -m llm_wiki_bench.run --dataset hotpotqa --only-download
 python -m llm_wiki_bench.run --dataset hotpotqa --only-preprocess --limit 10
 python -m llm_wiki_bench.bench_ingest \
   --dataset hotpotqa --wiki-dir wiki_output/hotpotqa/demo/wiki
-
-# Inspect summary groups without writes or model calls.
-python -m llm_wiki_bench.build_summaries \
-  --wiki-dir wiki_output/hotpotqa/demo/wiki --dry-run
-
-# Rebuild missing or stale summaries; reuse unchanged successful groups.
-python -m llm_wiki_bench.build_summaries \
-  --wiki-dir wiki_output/hotpotqa/demo/wiki
 ```
 
 The dataset runners also support `musique` and `2wikimhqa`.
@@ -293,7 +275,7 @@ articles = sorted(config.RAW_DIR.glob("*.md"))
 if not articles:
     raise SystemExit("No Markdown articles found.")
 stats = ingest_batch(articles, batch_size=3)
-if stats["failed"] or stats["summaries"]["failed"]:
+if stats["failed"]:
     raise SystemExit("Build incomplete; inspect the reported errors.")
 ```
 
@@ -361,7 +343,7 @@ questions, corpus, models, and budgets.
 | `llm_wiki_bench/bench_ingest.py`       | Page selection, fact proposals, validation, retries, and build receipts. |
 | `llm_wiki_bench/wiki_documents.py`     | Article archives, document rendering, and source-reference checks.       |
 | `llm_wiki_bench/knowledge_updates.py`  | Fact IDs and preservation of earlier page knowledge.                     |
-| `llm_wiki_bench/build_summaries.py`    | Related-page grouping, summary generation, and freshness checks.         |
+| `llm_wiki_bench/summary_catalog.py`    | Read-only member-group and freshness checks for existing summaries.     |
 | `llm_wiki_bench/summary_retrieval.py`  | BM25, dense ranking, and RRF.                                            |
 | `llm_wiki_bench/embedding_client.py`   | Embedding API calls and SQLite cache.                                    |
 | `llm_wiki_bench/token_budget.py`       | Response token accounting and text truncation.                           |
@@ -386,8 +368,8 @@ python -m unittest discover -s tests -v
 ```
 
 Tests use scripted model responses to check ingestion, knowledge preservation,
-summary coverage, retrieval, navigation, evidence registration, and QA validation
-without LLM API calls.
+existing-summary freshness, retrieval, navigation, evidence registration, and QA
+validation without LLM API calls.
 
 ## License
 

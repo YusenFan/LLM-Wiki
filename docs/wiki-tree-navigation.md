@@ -33,24 +33,18 @@ film/ed_wood_film.md                 — Ed Wood (film)
 summaries/ed-wood-and-ed-wood-film.md — Ed Wood and Ed Wood (film)
 ```
 
-摘要生成后从 title 生成安全、长度受限的可读文件名。重名的不同成员组使用 `-2`、`-3` 等后缀。成员组身份由 frontmatter 中的 members 确定，缓存新鲜度由 fingerprint 校验；哈希仍可用作内容校验值，但不再作为摘要文件名或匹配信号。
+已有摘要的成员组身份由 frontmatter 中的 members 确定，新鲜度由 fingerprint 校验；文件名不参与检索评分。summary page 生成代码已移除，新 Wiki 使用 `--summary-mode tree`。
 
 原文按 main 的标题规则保存为 `sources/articles/<source-title>.md`，重新包装 source frontmatter 和 H1。同标题不同内容用数字后缀保留。知识页直接链接到 `sources/articles/<source-title>`，需要原文证据时使用 source_read。sources 下仅原文目录进入检索；内部内容版本校验仍保留。现有 Wiki 输出不会自动迁移，旧版本需在新目录重建以更新来源链接。
 
-## 已有摘要离线迁移
+## 已有摘要读取
 
-```bash
-python -m llm_wiki_bench.build_summaries \
-  --wiki-dir wiki_output/hotpotqa/test-one/wiki \
-  --rename-existing
-```
-
-无需模型调用。有效哈希摘要按已有标题改名，内容不变；旧文件（包括失效摘要）移到 `.build/legacy-summaries/` 备份，并重建摘要索引。工具会输出原路径到新路径的映射；重复执行不会重复迁移。旧运行日志仍记录历史路径，备份可用于查看其原始摘要。
-
-读取端也能识别尚未迁移的旧摘要，并从页面标题展示名称。构建和缓存以 members/fingerprint 检查摘要身份，不依赖某个固定文件名。
+读取端保留已有可读名称及旧哈希名称摘要的兼容能力，从页面标题展示名称。
+`summary_catalog.current_summaries()` 只检查 members/fingerprint，不改名、不生成页面。
+原来的生成和 `--rename-existing` 命令已随 `build_summaries.py` 删除。
 
 ## 验证与边界
 
-`tests/test_tree_navigation.py` 覆盖目录发现、分页、标题展示、原文版本保持、重名摘要、旧摘要迁移、失效摘要隔离和缓存复用。
+`tests/test_tree_navigation.py` 覆盖目录发现、分页、标题展示、原文版本保持、旧哈希摘要读取、重复摘要选择、失效摘要隔离和只读行为。
 
 目录树帮助模型看见同名的不同对象。它不保证模型选对实体，也不证明最终引用支持结论；这些仍需在 QA 结果中分别评估。
