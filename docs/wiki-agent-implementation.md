@@ -1,4 +1,4 @@
-> 2026-10-04 来源保存更新：原文恢复 main 的标题文件名和 Markdown 包装，同标题不同内容使用数字后缀。新知识页来源指向 `sources/digests/<source-title>`，digest 的 Original 再指向 `sources/articles/<source-title>`；digest 由已校验事实整理，不增加模型调用。内部缓存及证据版本仍使用内容指纹。现有输出未自动迁移，以下哈希命名、直接 article 链接和取消 digest 的表格是历史记录。当前格式见 [Wiki schema](../configs/wiki-schema.md)。
+> 2026-10-05 来源保存更新：知识页直接链接到 `sources/articles/<source-title>`，不再生成、索引或读取 digest 页。原文保留标题文件名和 Markdown 包装，同标题不同内容使用数字后缀。内部缓存及证据版本仍使用内容指纹，构建回执 schema 更新为 `title-article-v1`。现有输出未自动迁移，需在新目录重建以更新来源链接。下文为历史实施记录，当前格式见 [Wiki schema](../configs/wiki-schema.md)。
 
 > 2026-09-17 摘要检索更新：默认入口为 summary 层 BM25 + dense + RRF，正文按 token 预算加载，可在同一 QA 循环补查；目录工具继续保留。见 [摘要混合检索](summary-hybrid-retrieval.md)。旧字段加权和哈希匹配未恢复；以下搜索相关表格属于历史实现记录。
 

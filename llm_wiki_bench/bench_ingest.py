@@ -17,9 +17,9 @@ from build_progress import show_progress
 from llm_client import call_llm_json
 from knowledge_updates import fact_catalog, merge_knowledge
 from wiki_documents import (
-    RESERVED_DIRS, SOURCE_SCHEMA, ARTICLE_PREFIX, DIGEST_PREFIX, archive_article,
-    article_reference, cited_articles, digest_path, knowledge_pages, parse_document,
-    render_digests, render_knowledge, source_link, wiki_path, write_document,
+    RESERVED_DIRS, SOURCE_SCHEMA, ARTICLE_PREFIX, archive_article,
+    article_reference, cited_articles, knowledge_pages, parse_document,
+    render_knowledge, wiki_path, write_document,
 )
 
 
@@ -34,7 +34,7 @@ _BUILD_PROMPT = """Organize the supplied articles into knowledge pages. Return J
 "related_pages": [{"path": "PAGE_TYPE/topic.md", "reason": "A brief, supported relationship"}]}]}
 Rules:
 - Every fact must link its supporting article(s), using the supplied paths exactly.
-- Python renders knowledge-page source links to sources/digests/ and each digest's Original link to its article.
+- Python renders knowledge-page source links directly to sources/articles/.
 - Do not output quotes, line ranges or fragment IDs. Python resolves article content from disk.
 - Preserve names, dates, conditions and uncertainty.
 - Use only supplied article evidence, including existing-page evidence. No own-knowledge completion.
@@ -42,7 +42,7 @@ Rules:
 - Merge duplicate facts while retaining each supporting input article citation. Never append an unrelated citation just to pass coverage.
 - Preserve short disambiguation statements as facts about the shared name; do not invent the missing list or equate namesakes.
 - Use concepts for abstract topics and methods when no specialized directory fits, and entities for otherwise unclassified entities.
-- Do not produce digests, summaries or indexes.
+- Produce only knowledge-page proposals, without summaries or indexes.
 - Use a listed page-type directory, canonical filenames and existing paths when updating a page.
 - When updating an existing page, output additions only. Python preserves all earlier facts and sources.
   Never delete, replace or silently overwrite old facts, even when newer evidence disagrees.
@@ -70,7 +70,7 @@ def save_cache(cache: dict) -> None:
 
 
 def _cache_valid(entry: object, root: Path) -> bool:
-    """Old digest receipts and failed/incomplete writes are not successful new builds."""
+    """Only current-schema receipts with intact articles and citations are successful builds."""
     if not isinstance(entry, dict) or entry.get("schema") != SOURCE_SCHEMA:
         return False
     outputs = entry.get("outputs", [])
@@ -81,15 +81,9 @@ def _cache_valid(entry: object, root: Path) -> bool:
         if not isinstance(entry.get('version'), str):
             return False
         article_reference(root, {'article': article, 'version': entry['version']})
-        digest = digest_path(article)
-        digest_text = wiki_path(root, digest).read_text(encoding='utf-8')
-        if cited_articles(root, source_link({'article': article})) != {article}:
-            return False
-        if hashlib.sha256(digest_text.encode('utf-8')).hexdigest() != entry.get('digest_version'):
-            return False
         for relative in outputs:
             text = wiki_path(root, relative).read_text(encoding='utf-8')
-            if source_link({'article': article}) not in text or article not in cited_articles(root, text):
+            if article not in cited_articles(text):
                 return False
         return True
     except (ValueError, OSError, TypeError):
@@ -102,7 +96,7 @@ def _article_context(article: dict) -> str:
 
 def _existing_evidence(root: Path, pages: dict[str, str]) -> list[dict]:
     """Existing citations must remain checkable while a knowledge page is updated."""
-    paths = sorted({p for text in pages.values() for p in cited_articles(root, text)})
+    paths = sorted({p for text in pages.values() for p in cited_articles(text)})
     blocks = []
     for path in paths:
         reference = article_reference(root, {'article': path})
@@ -134,7 +128,7 @@ def _validate_proposal(root, proposal, directories, existing, selected_pages, ar
     for relative, page in pending.items():
         text, cited = render_knowledge(root, page, available)
         if relative in selected_pages:
-            cited.update(cited_articles(root, selected_pages[relative]))
+            cited.update(cited_articles(selected_pages[relative]))
             text = merge_knowledge(selected_pages[relative], text, page)
         rendered[relative] = text
         page_sources[relative] = cited
@@ -239,10 +233,6 @@ def _ingest_batch_one(batch_paths: list[Path], cache: dict, trace: dict | None =
     trace["generation_input"] = context
     rendered, page_sources = _generate_validated_pages(
         root, directories, existing, selected_pages, articles, existing_evidence, context, trace)
-    digests = render_digests(articles, trace['proposal']['pages'])
-    for relative, text in digests.items():
-        trace['stage'] = 'write'
-        write_document(wiki_path(root, relative), text)
     for relative, text in rendered.items():
         trace["stage"] = "write"
         write_document(wiki_path(root, relative), text)
@@ -251,7 +241,6 @@ def _ingest_batch_one(batch_paths: list[Path], cache: dict, trace: dict | None =
         cache[article["input_version"]] = {"schema": SOURCE_SCHEMA, "status": "ingested",
                                       "file": path.name, "article": article["article"],
                                       "version": article['version'],
-                                      "digest_version": hashlib.sha256(digests[digest_path(article['article'])].encode('utf-8')).hexdigest(),
                                       "outputs": [p for p, sources in page_sources.items()
                                                   if article["article"] in sources]}
     save_cache(cache)
@@ -268,16 +257,15 @@ def rebuild_indexes(root: Path) -> None:
         directories.setdefault(str(PurePosixPath(path).parent), []).append(f"- [[{path[:-3]}]] — {title}")
     for directory, entries in directories.items():
         write_document(root / directory / "_index.md", f"# {directory}\n\n" + "\n".join(entries) + "\n")
-    for directory in (ARTICLE_PREFIX.rstrip('/'), DIGEST_PREFIX.rstrip('/')):
-        entries = []
-        for path in sorted((root / directory).glob('*.md')):
-            if path.name == '_index.md':
-                continue
-            metadata, _ = parse_document(path.read_text(encoding='utf-8'))
-            entries.append(f"- [[{directory}/{path.stem}]] — {metadata.get('source_title', path.stem)}")
-        write_document(root / directory / '_index.md', f"# {directory}\n\n" + '\n'.join(entries) + '\n')
+    directory = ARTICLE_PREFIX.rstrip('/')
+    entries = []
+    for path in sorted((root / directory).glob('*.md')):
+        if path.name == '_index.md':
+            continue
+        metadata, _ = parse_document(path.read_text(encoding='utf-8'))
+        entries.append(f"- [[{directory}/{path.stem}]] — {metadata.get('source_title', path.stem)}")
+    write_document(root / directory / '_index.md', f"# {directory}\n\n" + '\n'.join(entries) + '\n')
     lines = ["# Wiki", "", "- [[summaries/_index]] — High-level navigation summaries",
-             "- [[sources/digests/_index]] — Source digests; follow Original links for evidence",
              "- [[sources/articles/_index]] — Original source articles"]
     lines.extend(f"- [[{d}/_index]] — {len(entries)} knowledge pages" for d, entries in sorted(directories.items()))
     write_document(root / "index.md", "\n".join(lines) + "\n")

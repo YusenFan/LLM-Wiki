@@ -19,7 +19,7 @@ QA agent 保留文件目录浏览能力。默认入口现已改为 [摘要混合
 - `wiki_read(paths, offset=0)`：在 token 预算内阅读 1–10 个选中文件。返回截断标记和字符 next_offset；续读时只传一个 path。摘要用于导航，知识页可直接支撑答案；原文文件返回路径与行数，提示按需调用 source_read。
 - `source_read(article, start_line, end_line)`：读取原文，返回实际路径、版本和引文。
 
-`depth` 范围为 1–10，`limit` 为 1–200。大目录可按子目录展开，或使用同一 path/depth 和 next_offset 继续。tree 对照模式的初始树最多展示 200 项，并明确提示后续分页入口。隐藏构建文件、旧 digest 和失效摘要不进入 QA 目录视图。
+`depth` 范围为 1–10，`limit` 为 1–200。大目录可按子目录展开，或使用同一 path/depth 和 next_offset 继续。tree 对照模式的初始树最多展示 200 项，并明确提示后续分页入口。隐藏构建文件、非原文来源页和失效摘要不进入 QA 目录视图。
 
 旧 `wiki_search`、自定义字段打分，以及 QA 的 `--patience` 和 `--select-pages` 参数已移除。新的 `summary_search` 只检索有效摘要，使用标准 BM25/dense/RRF。`--t-max`、证据状态和答案提交规则继续使用。
 
@@ -35,7 +35,7 @@ summaries/ed-wood-and-ed-wood-film.md — Ed Wood and Ed Wood (film)
 
 摘要生成后从 title 生成安全、长度受限的可读文件名。重名的不同成员组使用 `-2`、`-3` 等后缀。成员组身份由 frontmatter 中的 members 确定，缓存新鲜度由 fingerprint 校验；哈希仍可用作内容校验值，但不再作为摘要文件名或匹配信号。
 
-原文按 main 的标题规则保存为 `sources/articles/<source-title>.md`，重新包装 source frontmatter 和 H1。同标题不同内容用数字后缀保留。知识页链接到 `sources/digests/<source-title>`，digest 的 Original 再链接原文。新 digest 可通过 tree/read 导航，但不提供证据 ID；内部内容版本校验仍保留。现有 Wiki 输出不会自动迁移。
+原文按 main 的标题规则保存为 `sources/articles/<source-title>.md`，重新包装 source frontmatter 和 H1。同标题不同内容用数字后缀保留。知识页直接链接到 `sources/articles/<source-title>`，需要原文证据时使用 source_read。sources 下仅原文目录进入检索；内部内容版本校验仍保留。现有 Wiki 输出不会自动迁移，旧版本需在新目录重建以更新来源链接。
 
 ## 已有摘要离线迁移
 

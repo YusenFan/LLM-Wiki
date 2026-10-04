@@ -11,8 +11,7 @@ import yaml
 
 
 ARTICLE_PREFIX = "sources/articles/"
-DIGEST_PREFIX = "sources/digests/"
-SOURCE_SCHEMA = "title-digest-v1"
+SOURCE_SCHEMA = "title-article-v1"
 RESERVED_DIRS = {"sources", "summaries", "syntheses"}
 
 
@@ -95,66 +94,10 @@ def archive_article(root: Path, source: Path) -> dict:
             "title": title, "text": archived}
 
 
-def digest_path(article: str) -> str:
-    """Each digest shares its original article's readable, collision-safe stem."""
-    if not article.startswith(ARTICLE_PREFIX):
-        raise ValueError("digest requires a sources/articles/ path")
-    return DIGEST_PREFIX + article[len(ARTICLE_PREFIX):]
-
-
-def source_link(citation: dict) -> str:
-    # Existing corpora are not migrated here; their original links must remain readable.
-    if re.fullmatch(r'[0-9a-f]{64}', PurePosixPath(citation['article']).stem):
-        return citation_link(citation)
-    return f"[[{digest_path(citation['article'])[:-3]}]]"
-
-
-def cited_articles(root: Path, text: str) -> set[str]:
-    """Follow digest → Original; also accept earlier direct article citations."""
-    articles = set()
-    for link in re.findall(r'\[\[(sources/(?:articles|digests)/[^\]#|]+)(?:[^\]]*)\]\]', text):
-        relative = link.removesuffix('.md') + '.md'
-        if relative.startswith(ARTICLE_PREFIX):
-            articles.add(relative)
-            continue
-        metadata, body = parse_document(wiki_path(root, relative).read_text(encoding='utf-8'))
-        if metadata.get('schema') != SOURCE_SCHEMA:
-            raise ValueError(f"unverified source digest: {relative}")
-        originals = re.findall(r'\[\[(sources/articles/[^\]#|]+)(?:[^\]]*)\]\]', body)
-        resolved = {p.removesuffix('.md') + '.md' for p in originals}
-        if len(resolved) != 1 or digest_path(next(iter(resolved))) != relative:
-            raise ValueError(f"digest must link its original article: {relative}")
-        article_reference(root, {'article': next(iter(resolved)), 'version': metadata.get('article_version')})
-        articles.update(resolved)
-    return articles
-
-
-def render_digests(articles: list[dict], pages: list[dict]) -> dict[str, str]:
-    """Summarize each source using the model's validated, source-attributed facts."""
-    rendered = {}
-    for article in articles:
-        facts, entities, descriptions, context = [], [], [], []
-        for page in pages:
-            supported = [f['text'] for f in page['facts']
-                         if any(c['article'] == article['article'] for c in f['citations'])]
-            if supported:
-                facts.extend(supported)
-                entities.append(page['title'])
-                descriptions.append(page['description'])
-                context.extend(f"[[{link['path'][:-3]}]] — {link['reason']}"
-                               for link in page.get('related_pages', []))
-        lines = [f"# {article['title']}", "", "> Digest of the original source article.", "",
-                 "## Summary", " ".join(dict.fromkeys(descriptions)), "", "## Key Facts"]
-        lines.extend(f"- {fact}" for fact in dict.fromkeys(facts))
-        lines.extend(["", "## Key Entities"])
-        lines.extend(f"- {entity}" for entity in dict.fromkeys(entities))
-        lines.extend(["", "## Related Context"])
-        lines.extend(f"- {item}" for item in dict.fromkeys(context))
-        lines.extend(["", "## Original", f"- {citation_link(article)}"])
-        metadata = {"type": "source", "schema": SOURCE_SCHEMA, "source_title": article['title'],
-                    "article_version": article['version']}
-        rendered[digest_path(article['article'])] = render_document(metadata, '\n'.join(lines))
-    return rendered
+def cited_articles(text: str) -> set[str]:
+    """Collect direct article citations, including earlier line-range links."""
+    links = re.findall(r'\[\[(sources/articles/[^\]#|]+)(?:[^\]]*)\]\]', text)
+    return {link.removesuffix('.md') + '.md' for link in links}
 
 
 def article_reference(root: Path, citation: dict) -> dict:
@@ -268,9 +211,9 @@ def render_knowledge(root: Path, proposal: dict, available: set[str]) -> tuple[s
         claim = text_field(fact.get("text"), "fact")
         # Store source links, not model-written quotes or a forced passage selection.
         citations = [article_reference(root, c) for c in fact["citations"]]
-        lines.append(f"- {claim} " + " ".join(source_link(c) for c in citations))
+        lines.append(f"- {claim} " + " ".join(citation_link(c) for c in citations))
         for citation in citations:
-            sources[source_link(citation)] = citation
+            sources[citation_link(citation)] = citation
     links = proposal.get("related_pages", [])
     if not isinstance(links, list):
         raise ValueError("related_pages must be a list")

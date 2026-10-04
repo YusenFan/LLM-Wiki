@@ -17,7 +17,7 @@ from wiki_agent import WikiAgent
 from evidence_snapshots import evidence_id
 from wiki_documents import (
     archive_article, article_reference, citation_link, knowledge_pages, parse_document, read_article,
-    related_pages, render_digests, render_knowledge, source_link, digest_path, validate_citation, wiki_path,
+    related_pages, render_knowledge, validate_citation, wiki_path,
 )
 from wiki_retriever import WikiRetriever
 
@@ -37,8 +37,6 @@ class WorkflowTest(unittest.TestCase):
         self.raw.write_text('---\ntitle: Alpha\n---\n\n# Alpha\n\nAlpha founded Beta.\nBeta is in Paris.\n', encoding='utf-8')
         self.article = archive_article(self.root, self.raw)
         self.citation = read_article(self.root, self.article['article'], 8, 8)
-        for path, text in render_digests([self.article], [self.proposal()]).items():
-            self.write(path, text)
 
     def write(self, relative, text):
         path = self.root / relative
@@ -91,11 +89,11 @@ class WorkflowTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             wiki_path(self.root, 'escape/article.md')
 
-    def test_knowledge_renders_digest_citations_and_zero_relations(self):
+    def test_knowledge_renders_article_citations_and_zero_relations(self):
         proposal = self.proposal()
         text, sources = render_knowledge(self.root, proposal, {proposal['path']})
-        self.assertIn(source_link({"article": self.article["article"]}), text)
-        self.assertNotIn('sources/articles/', text)
+        self.assertIn(citation_link({"article": self.article["article"]}), text)
+        self.assertIn('sources/articles/', text)
         self.assertEqual(related_pages(text), {})
         self.assertEqual(sources, {self.article['article']})
         proposal['related_pages'] = [{'path': 'entities/b.md', 'reason': 'founded by Alpha'}]
@@ -172,6 +170,10 @@ class WorkflowTest(unittest.TestCase):
             with patch.object(bench_ingest, 'call_llm_json', return_value=proposal):
                 stats = bench_ingest.ingest_batch([self.raw])
             self.assertEqual(stats['success'], 1)
+            self.assertFalse((self.root / 'sources/digests').exists())
+            index = (self.root / 'index.md').read_text()
+            self.assertIn('[[sources/articles/_index]]', index)
+            self.assertNotIn('sources/digests', index)
             cache = bench_ingest.load_cache()
             self.assertTrue(bench_ingest._cache_valid(cache[self.article['input_version']], self.root))
             self.assertFalse(bench_ingest._cache_valid({'status': 'ingested'}, self.root))
@@ -277,19 +279,22 @@ class WorkflowTest(unittest.TestCase):
             config.ensure_wiki_dirs()
             self.assertTrue({'music', 'entities', 'concepts'} <= set(config.get_page_types()))
             self.assertTrue((self.root / 'concepts').is_dir())
+            self.assertFalse((self.root / 'sources/digests').exists())
+            self.assertIn('**sources/** (1 pages)', config.get_dir_catalog_text())
 
     def test_direct_knowledge_article_access_through_tree(self):
         text, _ = render_knowledge(self.root, self.proposal(), {'entities/alpha.md'})
         self.write('entities/alpha.md', text)
-        self.write('sources/digests/old.md', '# Alpha\nUnverified old digest')
+        self.write('sources/digests/old.md', '---\nschema: title-digest-v1\n---\n# Alpha\nOld source summary')
         self.write('sources/old.md', '# Alpha\nLegacy source summary')
+        self.write('sources/digests/_index.md', '# Old source summaries\n')
         retriever = WikiRetriever(self.root)
         entries = retriever.tree(depth=3)['entries']
         self.assertTrue(any(e['path'] == 'entities/alpha.md' for e in entries))
         self.assertTrue(any(e.get('layer') == 'articles' for e in entries))
-        self.assertIn(digest_path(self.article['article']), retriever.pages)
         self.assertNotIn('sources/digests/old.md', retriever.pages)
         self.assertNotIn('sources/old.md', retriever.pages)
+        self.assertNotIn('sources/digests', retriever.dir_indexes)
         self.assertEqual(retriever.read(['entities/alpha'])[0]['type'], 'file')
         self.assertEqual(retriever.read([self.article['article']])[0]['type'], 'article')
         self.assertEqual(retriever.source_read(self.article['article'], 8, 8)['quote'], self.citation['quote'])
@@ -316,35 +321,31 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(result.pages, [])  # no hidden auto-read beyond budget
         self.assertEqual(result.evidence, [])
 
-    def test_digest_traversal_reaches_original_without_digest_evidence(self):
+    def test_knowledge_source_link_reaches_original_article_evidence(self):
         text, _ = render_knowledge(self.root, self.proposal(), {'entities/alpha.md'})
         self.write('entities/alpha.md', text)
         retriever = WikiRetriever(self.root)
-        digest = digest_path(self.article['article'])
-        digest_row = retriever.read([source_link(self.citation)])[0]
-        self.assertEqual(digest_row['path'], digest)
-        self.assertEqual(digest_row['meta']['layer'], 'digests')
-        self.assertNotIn('evidence', digest_row)
-        self.assertIn(citation_link({'article': self.article['article']}), digest_row['text'])
-        self.assertIn('Alpha founded Beta.', digest_row['text'])
-        for section in ('Summary', 'Key Facts', 'Key Entities', 'Related Context', 'Original'):
-            self.assertIn(f'## {section}', digest_row['text'])
+        article_row = retriever.read([citation_link({'article': self.article['article']})])[0]
+        self.assertEqual(article_row['path'], self.article['article'])
+        self.assertEqual(article_row['type'], 'article')
         passage = json.loads(retriever.execute_tool('source_read', {
             'article': self.article['article'], 'start_line': 8, 'end_line': 8}))
         self.assertEqual(passage['quote'], 'Alpha founded Beta.')
         self.assertTrue(passage['evidence'])
 
-    def test_cache_checks_title_article_and_digest_integrity(self):
+    def test_cache_checks_article_integrity_and_rejects_obsolete_schema(self):
         with self.config_patches(), patch.object(config, 'get_page_types', return_value={'entities': {}}), \
                 patch.object(bench_ingest, 'call_llm_json', return_value={'pages': [self.proposal()]}):
             bench_ingest._ingest_batch_one([self.raw], {})
             receipt = bench_ingest.load_cache()[self.article['input_version']]
         self.assertTrue(bench_ingest._cache_valid(receipt, self.root))
-        digest = self.root / digest_path(self.article['article'])
-        original = digest.read_text()
-        digest.write_text(original.replace('sources/articles/alpha', 'sources/articles/missing'))
+        obsolete = {**receipt, 'schema': 'title-digest-v1'}
+        self.assertFalse(bench_ingest._cache_valid(obsolete, self.root))
+        page = self.root / 'entities/alpha.md'
+        original = page.read_text()
+        page.write_text(original.replace(citation_link({'article': self.article['article']}), ''))
         self.assertFalse(bench_ingest._cache_valid(receipt, self.root))
-        digest.write_text(original)
+        page.write_text(original)
         article = self.root / self.article['article']
         article.write_text(article.read_text() + '\nTampered source.\n')
         self.assertFalse(bench_ingest._cache_valid(receipt, self.root))
@@ -361,7 +362,7 @@ class WorkflowTest(unittest.TestCase):
         source.write_text('---\ntitle: \'[]/#\'\n---\n\nFallback.\n')
         self.assertEqual(archive_article(self.root, source)['article'], 'sources/articles/article.md')
 
-    def test_legacy_article_links_remain_readable_without_missing_digest(self):
+    def test_legacy_hash_article_links_remain_readable(self):
         original = '# Earlier source\n\nEarlier fact.\n'
         version = hashlib.sha256(original.encode()).hexdigest()
         article = f'sources/articles/{version}.md'
@@ -512,7 +513,7 @@ class WorkflowTest(unittest.TestCase):
         proposal = self.proposal()
         proposal['facts'][0]['citations'] = [{'article': article['article'], 'quote': 'First sentence.'}]
         text, _ = render_knowledge(self.root, proposal, {proposal['path']})
-        self.assertIn(source_link({'article': article['article']}), text)
+        self.assertIn(citation_link({'article': article['article']}), text)
         self.assertNotIn('#L', text)
 
     def test_later_batch_selects_existing_page_and_reads_article_links(self):

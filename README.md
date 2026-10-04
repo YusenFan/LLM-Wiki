@@ -22,10 +22,8 @@ flowchart TD
         Articles --> Proposals[LLM page selection and fact proposals]
         Existing[Existing pages and their source articles] --> Proposals
         Proposals --> Validate[Python validation and incremental merge]
-        Validate --> Knowledge[Knowledge pages with facts and digest links]
-        Validate --> Digests[Source digests with Original links]
-        Knowledge --> Digests
-        Digests --> Articles
+        Validate --> Knowledge[Knowledge pages with facts and article links]
+        Knowledge --> Articles
         Knowledge --> Groups[Python groups explicit Related Pages]
         Groups --> Summaries[LLM group summaries or Python singleton summaries]
     end
@@ -50,8 +48,7 @@ flowchart TD
 | Layer           | Contents                                                                                                                                         | Role in QA                                                                             |
 | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------- |
 | Articles        | Title-based Markdown originals under `sources/articles/<source-title>.md`; numeric suffixes preserve same-title different content. | Optional source passages for additional detail, ambiguity, conflicts, or verification. |
-| Source digests  | Structured source summaries under `sources/digests/<source-title>.md`, with an Original link to the article. | Navigate from knowledge pages to originals; digests provide no answer evidence IDs. |
-| Knowledge pages | Entity, concept, event, or other configured pages containing facts, digest links, explained relationships, and update records.                  | Read facts can directly support an answer.                                             |
+| Knowledge pages | Entity, concept, event, or other configured pages containing facts, article links, explained relationships, and update records.                  | Read facts can directly support an answer.                                             |
 | Summaries       | One level of navigation summaries with explicit member-page links and content fingerprints.                                                      | Retrieval entry points; summaries cannot serve as final answer evidence.               |
 
 The Wiki uses Markdown and YAML frontmatter on disk. Summary embeddings are
@@ -91,9 +88,8 @@ For each article batch, `bench_ingest.ingest_batch()`:
    and Related Pages links with explanations.
 5. Validates paths, article references, update records, and citation
    coverage for every input article before writing knowledge pages.
-6. Renders knowledge pages and source digests, records successful articles, and rebuilds navigation indexes.
-   Knowledge-page sources link to digests; each digest links to its original article.
-   Digests summarize validated, source-attributed model facts without another model call.
+6. Renders knowledge pages with direct links to original articles, records successful articles,
+   and rebuilds navigation indexes.
 
 Each fact must reference at least one supplied article. At construction time,
 the model supplies article paths; it does not copy exact quotations or calculate
@@ -180,7 +176,7 @@ IDs into exact citations:
 
 The model supplies claims and evidence IDs; Python supplies quotation text and
 coordinates. Unknown IDs, unread text, and citations outside delivered excerpts
-are rejected. Summary text, source digests, directory listings, and relationship descriptions
+are rejected. Summary text, directory listings, and relationship descriptions
 do not provide answer evidence IDs. Invalid submissions return errors to the
 same agent so it can correct them within the remaining budget.
 
