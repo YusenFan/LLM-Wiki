@@ -15,6 +15,12 @@ SOURCE_SCHEMA = "title-article-v1"
 RESERVED_DIRS = {"sources", "summaries", "syntheses"}
 
 
+def is_knowledge_directory(name: object) -> bool:
+    """Topic directories use safe single-level slugs, independent of page schema."""
+    return (isinstance(name, str) and len(name) <= 64 and name not in RESERVED_DIRS
+            and re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", name) is not None)
+
+
 def resolve_wiki_link(value: str, known_paths: Collection[str]) -> str:
     """Resolve a generated wikilink against known paths, without guessing files."""
     if not isinstance(value, str):
@@ -203,7 +209,7 @@ def render_knowledge(root: Path, proposal: dict, available: set[str]) -> tuple[s
     facts = proposal.get("facts")
     if not isinstance(facts, list) or not facts:
         raise ValueError("knowledge pages require cited facts")
-    lines = [f"# {title}", "", f"> {description}", "", "## Core Facts"]
+    lines = [f"# {title}", "", f"> {description}", "", "## Facts"]
     sources = {}
     for fact in facts:
         if not isinstance(fact, dict) or not isinstance(fact.get("citations"), list) or not fact["citations"]:
@@ -217,7 +223,8 @@ def render_knowledge(root: Path, proposal: dict, available: set[str]) -> tuple[s
     links = proposal.get("related_pages", [])
     if not isinstance(links, list):
         raise ValueError("related_pages must be a list")
-    lines.extend(["", "## Related Pages"])
+    if links:
+        lines.extend(["", "## Related Pages"])
     seen = set()
     for link in links:
         if not isinstance(link, dict):
@@ -229,9 +236,9 @@ def render_knowledge(root: Path, proposal: dict, available: set[str]) -> tuple[s
         if target not in seen:
             lines.append(f"- [[{target[:-3]}]] — {reason}")
             seen.add(target)
-    lines.extend(["", "## Related Sources"])
-    lines.extend(f"- {link}" for link in sources)
-    metadata = {"type": proposal["path"].split("/")[0], "schema": SOURCE_SCHEMA,
-                "aliases": string_list(proposal.get("aliases", []), "aliases"),
-                "tags": string_list(proposal.get("tags", []), "tags")}
+    metadata = {"type": "knowledge", "schema": SOURCE_SCHEMA}
+    for field in ("aliases", "tags"):
+        values = string_list(proposal.get(field, []), field)
+        if values:
+            metadata[field] = values
     return render_document(metadata, "\n".join(lines)), {c["article"] for c in sources.values()}

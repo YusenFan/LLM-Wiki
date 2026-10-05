@@ -1,8 +1,6 @@
-# Knowledge page type registry for benchmark datasets
-# First ingestion: LLM automatically analyzes article samples and generates directory structure
-# New types are auto-appended to this file and corresponding directories are created
-#
-# Each type's description is shown to LLM to help it decide which directory to browse
-# Similar to skill description, it's the first layer of a two-level index
+# Subject-directory template. The legacy page_types key is retained for compatibility.
+# All generated knowledge pages share type: knowledge, regardless of directory.
+# First-run corpus samples suggest initial subjects; validated ingestion proposals
+# can add subjects to the Wiki-local page_types.yaml. Existing directories are reused.
 
 page_types: {}

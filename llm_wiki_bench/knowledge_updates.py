@@ -23,10 +23,13 @@ def fact_catalog(text: str) -> list[dict]:
     """Stable page-local IDs for existing facts, including pre-ID Markdown pages."""
     _, body = parse_document(text)
     facts = []
-    for line in _sections(body).get('Core Facts', '').splitlines():
-        if line.startswith('- '):
-            claim = re.split(r'\s*\[\[', line[2:], maxsplit=1)[0].strip()
-            facts.append({'id': fact_id(claim), 'text': claim})
+    for section, content in _sections(body).items():
+        if section not in {'Facts', 'Core Facts'}:
+            continue
+        for line in content.splitlines():
+            if line.startswith('- '):
+                claim = re.split(r'\s*\[\[', line[2:], maxsplit=1)[0].strip()
+                facts.append({'id': fact_id(claim), 'text': claim})
     return facts
 
 
@@ -35,6 +38,12 @@ def merge_knowledge(previous: str, rendered: str, proposal: dict) -> str:
     meta, body = parse_document(previous)
     incoming_meta, incoming_body = parse_document(rendered)
     sections, incoming = _sections(body), _sections(incoming_body)
+    # Normalize the legacy heading while retaining every old fact and citation.
+    normalized = {}
+    for name, content in sections.items():
+        name = 'Facts' if name == 'Core Facts' else name
+        normalized[name] = normalized.get(name, '') + content
+    sections = normalized
     old_facts = {f['text']: f['id'] for f in fact_catalog(previous)}
     known_ids = set(old_facts.values())
     updates = list(meta.get('knowledge_updates', []))
@@ -82,7 +91,10 @@ def merge_knowledge(previous: str, rendered: str, proposal: dict) -> str:
         existing_notes = sections.get('Knowledge Updates', '').strip('\n').splitlines()
         sections['Knowledge Updates'] = '\n'.join(dict.fromkeys(existing_notes + notes)).strip() + '\n\n'
     for field in ('aliases', 'tags'):
-        meta[field] = list(dict.fromkeys(meta.get(field, []) + incoming_meta.get(field, [])))
+        if field in meta or field in incoming_meta:
+            meta[field] = list(dict.fromkeys(meta.get(field, []) + incoming_meta.get(field, [])))
+    meta['type'] = 'knowledge'
+    meta['schema'] = incoming_meta['schema']
     combined = sections[''].rstrip() + '\n\n' + ''.join(
         f'## {name}\n{content.rstrip()}\n\n' for name, content in sections.items() if name)
     return render_document(meta, combined)

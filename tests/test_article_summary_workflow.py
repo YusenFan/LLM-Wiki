@@ -263,12 +263,14 @@ class WorkflowTest(unittest.TestCase):
             self.assertEqual(len(saved['attempts']), 3)
             self.assertTrue(all('error' in attempt for attempt in saved['attempts']))
 
-    def test_existing_taxonomy_gains_generic_categories(self):
+    def test_existing_taxonomy_is_preserved_without_generic_categories(self):
         self.write('page_types.yaml', 'page_types:\n  music:\n    description: Music\n')
         with self.config_patches(), patch.object(config, '_current_dataset', None):
             config.ensure_wiki_dirs()
-            self.assertTrue({'music', 'entities', 'concepts'} <= set(config.get_page_types()))
-            self.assertTrue((self.root / 'concepts').is_dir())
+            self.assertEqual(set(config.get_page_types()), {'music'})
+            self.assertTrue((self.root / 'music').is_dir())
+            self.assertFalse((self.root / 'concepts').exists())
+            self.assertFalse((self.root / 'entities').exists())
             self.assertFalse((self.root / 'sources/digests').exists())
             self.assertIn('**sources/** (1 pages)', config.get_dir_catalog_text())
 
@@ -445,7 +447,7 @@ class WorkflowTest(unittest.TestCase):
                 stats = bench_ingest.ingest_batch([self.raw])
                 self.assertIn('entities/example.md', generate.call_args.args[0])
                 self.assertNotIn('concepts/topic.md', generate.call_args.args[0])
-                self.assertIn('Allowed page-type directories: ["entities"]', generate.call_args.args[0])
+                self.assertIn('Directory catalog:\n{"entities": "entities"}', generate.call_args.args[1])
         self.assertEqual(stats['success'], 1)
         self.assertNotIn('summaries', stats)
         generate.assert_called_once()
@@ -492,8 +494,8 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(llm.call_count, 1)
         self.assertTrue(llm.call_args.args[0].startswith('Organize the supplied articles'))
         self.assertIn('entities/example.md', llm.call_args.args[0])
-        self.assertNotIn('PAGE_TYPE/', llm.call_args.args[0])
-        self.assertIn('Page types:', llm.call_args.args[1])
+        self.assertNotIn('DIRECTORY/', llm.call_args.args[0])
+        self.assertIn('Directory catalog:', llm.call_args.args[1])
 
     def test_article_reference_uses_full_original_content_without_quote_copy(self):
         self.raw.write_text('# Woodson\n\nFirst sentence.  Second sentence with 中文.\n', encoding='utf-8')

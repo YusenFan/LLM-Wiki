@@ -1,4 +1,4 @@
-# Wiki schema: article evidence and related-page summaries
+# Wiki schema: topic pages with article evidence
 
 Knowledge facts retain direct links to their **original articles**; QA may cite sufficiently
 explicit knowledge-page evidence directly and read articles for additional detail or verification:
@@ -15,8 +15,9 @@ summaries/ (navigation, tags, member knowledge pages)
   containing `type: source`, `source_title`, a single H1 and the original article body.
   Titles are sanitized and lowercased like main. Same-title different content uses
   numeric suffixes (`-2`, `-3`) so earlier originals remain available.
-- Knowledge directories declared in `page_types.yaml`: e.g. `entities/`,
-  `concepts/`, `events/`, `relations/`.
+- Subject directories declared in `page_types.yaml`: e.g. `science/`,
+  `history/`, `literature/`. They organize topics; every knowledge page shares
+  the same schema. Existing directory names remain valid.
 - `summaries/<readable-title>.md`: existing high-level navigation summaries;
   generation has been removed. Membership and freshness are checked
   from frontmatter, not filenames.
@@ -34,27 +35,22 @@ Python renders the page from a validated JSON proposal:
 
 ```markdown
 ---
-type: entities
+type: knowledge
 schema: title-article-v1
 aliases: [A]
-tags: [history]
 ---
 
 # Alpha
 
 > Alpha and its organization
 
-## Core Facts
+## Facts
 
 - Alpha founded Beta. [[sources/articles/alpha]]
 
 ## Related Pages
 
-- [[entities/beta]] — organization founded by Alpha
-
-## Related Sources
-
-- [[sources/articles/alpha]]
+- [[history/beta]] — organization founded by Alpha
 ```
 
 Every fact has at least one article citation. Citation input includes only the
@@ -63,6 +59,18 @@ without requiring a hash filename. Python renders direct article links on knowle
 pages. The model does not choose a fragment, count line numbers, or reproduce a quote during knowledge-page generation.
 Python reads the actual article content; it never persists model-written quotes
 as source text. Existing line-range links remain readable for compatibility.
+
+Title, one-line description and cited facts are required. Aliases and related
+pages are optional; empty metadata and empty Related Pages sections are omitted.
+Tags remain accepted for compatibility but are not requested by the prompt.
+Sources are already on individual facts, so new pages omit Related Sources.
+
+The generation proposal may contain `directories: {"new-subject": "Description"}`
+alongside `pages`. Reuse existing directories first. New directories must use
+lowercase single-level slugs (hyphens allowed), have a nonempty description,
+avoid reserved names, and contain a proposed page. Python checks the whole
+batch before writing pages or registering new subjects. Directory initialization
+does not impose entities/concepts, a fixed category count, or exhaustive partitioning.
 
 Related Pages can have zero, one or many reliable links. Each target must be an
 existing knowledge page or a knowledge page created in the same batch; each link
@@ -76,6 +84,9 @@ Non-additions must identify earlier facts from that page's supplied fact catalog
 all changes need a reason. `valid_at` is a source-supported time or null, never an
 inferred ingestion timestamp. Changes are recorded in `knowledge_updates` metadata
 and a readable `Knowledge Updates` section; even corrected facts remain available.
+Legacy Core Facts pages remain readable and retain stable fact IDs. When updated,
+their fact heading becomes Facts and their type becomes knowledge; existing
+extra sections and metadata are preserved. Untouched outputs are not migrated.
 
 ## Summary grouping
 
@@ -138,7 +149,8 @@ remain on disk but are excluded from retrieval. New Wikis use directory navigati
   with readable titles. Expand a subdirectory or continue with `next_offset`.
   Tree listings do not use relevance scores; summary ranking has no custom field bonuses.
 - `wiki_read(paths, offset?)` opens 1-10 pages within the same token budget,
-  including evidence IDs and text for knowledge-page facts and descriptions.
+  including evidence IDs and text for knowledge-page Facts (legacy Core Facts is
+  also supported) and descriptions.
   A truncated text returns `next_offset`, a character offset into the Markdown body;
   continue with one path. For an article it returns the path
   and line count, prompting `source_read` rather than treating navigation as proof.

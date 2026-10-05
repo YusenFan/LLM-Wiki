@@ -46,7 +46,7 @@ flowchart TD
 | Layer           | Contents                                                                                                                                         | Role in QA                                                                             |
 | --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------- |
 | Articles        | Title-based Markdown originals under `sources/articles/<source-title>.md`; numeric suffixes preserve same-title different content. | Optional source passages for additional detail, ambiguity, conflicts, or verification. |
-| Knowledge pages | Entity, concept, event, or other configured pages containing facts, article links, explained relationships, and update records.                  | Read facts can directly support an answer.                                             |
+| Knowledge pages | Topic pages with one shared schema: facts, article links, optional explained relationships, and update records. | Read facts can directly support an answer. |
 | Summaries       | Existing navigation summaries with explicit member-page links and content fingerprints; no longer generated.                                                      | Retrieval entry points; summaries cannot serve as final answer evidence.               |
 
 The Wiki uses Markdown and YAML frontmatter on disk. Summary embeddings are
@@ -67,10 +67,11 @@ numeric suffix rather than overwriting an earlier original. Internal SHA-256
 fingerprints remain for cache and evidence validation; filenames and source links
 use titles. Existing Wiki outputs are not automatically migrated.
 
-Wiki initialization creates the configured page-type directories and retains
-generic `entities` and `concepts` categories. First-time purpose and page-type
-initialization can call the LLM, with fallback configuration if initialization
-fails. It does not create factual knowledge pages.
+Wiki initialization suggests subject directories from corpus samples and creates
+them. It reuses existing catalogs without forcing `entities` or `concepts`;
+unavailable initialization falls back to `topics`. The legacy `page_types.yaml`
+name stores the directory catalog, while all generated pages use `type: knowledge`.
+Ingestion can propose a new subject directory when existing ones do not fit.
 
 ### 2. Compile facts into knowledge pages
 
@@ -80,14 +81,22 @@ For each article batch, `bench_ingest.ingest_batch()`:
 2. Archives the input articles. If knowledge pages already exist, a selection
    model chooses up to 15 existing pages to read for updates or relationships.
    An empty Wiki skips this selection step.
-3. Gives the generation model the input articles, selected page contents, their
-   existing source articles, fact IDs, and allowed page types.
+3. Gives the generation model the input articles, one subject-directory catalog,
+   page identities and aliases, and selected page contents. Existing fact IDs,
+   source articles and the update contract are included only when pages were selected;
+   an article already supplied in the input is not repeated as existing evidence.
 4. Receives a JSON proposal containing page paths, facts with article references,
    and Related Pages links with explanations.
-5. Validates paths, article references, update records, and citation
+5. Validates proposed new directories, paths, article references, update records, and citation
    coverage for every input article before writing knowledge pages.
-6. Renders knowledge pages with direct links to original articles, records successful articles,
-   and rebuilds navigation indexes.
+6. Renders knowledge pages with direct links to original articles, registers new
+   directories, records successful articles, and rebuilds navigation indexes.
+
+New pages have a title, one-line description, `Facts`, and optional `Related Pages`.
+Aliases are optional; tags remain supported for older proposals and pages but are
+not requested. Source references are attached to each fact, without a duplicate
+`Related Sources` section. Python owns the Markdown format. Benchmark ingestion
+uses a fixed multi-hop QA goal instead of a generated purpose prompt.
 
 Each fact must reference at least one supplied article. At construction time,
 the model supplies article paths; it does not copy exact quotations or calculate
@@ -115,6 +124,10 @@ Alpha lived in Paris in 2000. The new fact can link to the earlier fact as a
 `temporal_update`. Corrections and conflicts also retain the earlier statement
 and add an explanation. QA must use the dates and conditions relevant to the
 question.
+
+Legacy `Core Facts` pages remain readable. Updating one normalizes its heading to
+`Facts` and its type to `knowledge`, preserving fact IDs, earlier sources and
+history. Existing output directories and cached pages are not bulk-migrated.
 
 ### 4. Read existing summary navigation
 

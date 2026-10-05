@@ -17,7 +17,7 @@ def page_units(body: str) -> list[tuple[int, int]]:
         if line.startswith('## '):
             section = line[3:].strip().casefold()
             continue
-        if line.startswith('#') or section not in {'', 'core facts'}:
+        if line.startswith('#') or section not in {'', 'facts', 'core facts'}:
             continue
         prefix = 2 if line.startswith(('- ', '> ')) else 0
         text = line[prefix:].split('[[', 1)[0].rstrip()

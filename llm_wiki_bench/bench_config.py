@@ -18,6 +18,8 @@ import re
 import yaml
 from pathlib import Path
 
+from wiki_documents import is_knowledge_directory, text_field
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -87,12 +89,10 @@ FIXED_DIRS = {
     "summaries":        {"description": "High-level summaries grouped by Related Pages"},
 }
 
-# Default page types used when LLM auto-init fails.
+# Subject-directory fallback when corpus initialization is unavailable.
+# The page_types API/YAML key is retained for existing Wikis; pages use type: knowledge.
 DEFAULT_PAGE_TYPES = {
-    "entities":  {"description": "Entity pages — people, organizations, places, works, objects",  "auto_created": True},
-    "events":    {"description": "Event pages — historical events, incidents, ceremonies",          "auto_created": True},
-    "concepts":  {"description": "Concept pages — theories, methods, genres, abstract ideas",      "auto_created": True},
-    "relations": {"description": "Relation pages — comparisons and links between entities",         "auto_created": True},
+    "topics": {"description": "Topics awaiting a more specific subject directory", "auto_created": True},
 }
 
 # Compatibility stubs (not used in benchmark mode).
@@ -191,7 +191,7 @@ def split_frontmatter(text: str) -> tuple[str, str, str] | None:
 # ---------------------------------------------------------------------------
 
 def get_page_types() -> dict:
-    """Return page types: prefer wiki-local YAML, then configs template, then defaults."""
+    """Return subject directories: wiki-local YAML, then template, then fallback."""
     if WIKI_DIR is not None:
         wiki_yaml = WIKI_DIR / "page_types.yaml"
         if wiki_yaml.exists():
@@ -224,13 +224,17 @@ def save_page_types(page_types: dict) -> None:
 
 
 def register_page_type(name: str, description: str, auto_created: bool = True) -> None:
+    """Retain the legacy API name; register a subject directory, not a page schema."""
+    if not is_knowledge_directory(name):
+        raise ValueError(f"invalid knowledge directory: {name}")
+    description = text_field(description, "directory description")
     page_types = get_page_types()
     if name not in page_types:
         page_types[name] = {"description": description, "auto_created": auto_created}
         save_page_types(page_types)
         if WIKI_DIR is not None:
             (WIKI_DIR / name).mkdir(parents=True, exist_ok=True)
-        print(f"  Registered new page type: {name} — {description}")
+        print(f"  Registered knowledge directory: {name} — {description}")
 
 
 def apply_dir_changes(changes: list[dict]) -> None:
@@ -290,18 +294,10 @@ def get_dir_catalog_text() -> str:
 
 
 def ensure_wiki_dirs() -> None:
-    """Create wiki directories; auto-init page types on first run."""
+    """Create configured subject directories without imposing entities/concepts."""
     if WIKI_DIR is None:
         return
     WIKI_DIR.mkdir(parents=True, exist_ok=True)
-
-    if _current_dataset:
-        purpose_path = BASE_DIR / f"purpose_{_current_dataset}.md"
-        if not purpose_path.exists():
-            try:
-                auto_init_purpose()
-            except Exception:
-                pass
 
     yaml_path = WIKI_DIR / "page_types.yaml"
     need_init = True
@@ -317,12 +313,6 @@ def ensure_wiki_dirs() -> None:
             auto_init_page_types()
         except Exception:
             save_page_types(DEFAULT_PAGE_TYPES)
-
-    # Specialized auto-generated taxonomies must retain a home for arbitrary benchmark inputs.
-    page_types = get_page_types()
-    missing = {name: DEFAULT_PAGE_TYPES[name] for name in ("entities", "concepts") if name not in page_types}
-    if missing:
-        save_page_types({**page_types, **missing})
 
     for name, dir_path in get_page_dirs().items():
         dir_path.mkdir(parents=True, exist_ok=True)
@@ -448,7 +438,7 @@ def auto_init_purpose() -> Path | None:
 
 
 def auto_init_page_types() -> None:
-    """Ask the LLM to design 5-8 page-type directories for the corpus."""
+    """Suggest subject directories from corpus samples; ingestion can add more later."""
     from llm_client import call_llm_json
 
     samples = _sample_articles_for_init(n=200)
@@ -463,13 +453,12 @@ def auto_init_page_types() -> None:
     try:
         data = call_llm_json(
             system_prompt=(
-                "You are a knowledge base architect. Design 5-8 mutually exclusive, "
-                "collectively exhaustive page-type directories for the corpus below.\n"
-                "Output strictly JSON: "
+                "Suggest a few broad subject directories for the supplied corpus. "
+                "All pages share one knowledge schema; directories only organize topics.\n"
+                "Return JSON: "
                 '{"page_types": {"<name>": {"description": "<name> — short desc"}}}\n'
-                "Rules: lowercase single-word English names; avoid catch-all names "
-                "(misc/other/general/uncategorized); do not redefine the reserved "
-                "names sources, summaries, syntheses."
+                "Use lowercase directory slugs, optionally with hyphens. "
+                "Do not use the reserved names sources, summaries or syntheses."
             ),
             user_prompt=f"## Articles\n{sample_text}\n",
             model=LLM_PREMIUM_MODEL,
@@ -480,11 +469,15 @@ def auto_init_page_types() -> None:
         return
 
     raw_types = data.get("page_types", data) if isinstance(data, dict) else {}
-    page_types: dict = {
-        name: {"description": (info.get("description", name) if isinstance(info, dict) else info),
-               "auto_created": True}
-        for name, info in raw_types.items()
-        if isinstance(info, (dict, str)) and re.fullmatch(r"[a-z]+", name)
-        and name not in {"sources", "summaries", "syntheses"}
-    }
+    page_types = {}
+    if isinstance(raw_types, dict):
+        for name, info in raw_types.items():
+            if not is_knowledge_directory(name) or not isinstance(info, (dict, str)):
+                continue
+            try:
+                description = text_field(info.get("description", name) if isinstance(info, dict) else info,
+                                         "directory description")
+            except ValueError:
+                continue
+            page_types[name] = {"description": description, "auto_created": True}
     save_page_types(page_types if page_types else DEFAULT_PAGE_TYPES)

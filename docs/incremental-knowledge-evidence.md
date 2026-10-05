@@ -2,7 +2,9 @@
 
 ## 保留旧知识
 
-`bench_ingest._validate_proposal()` 先校验模型新增内容，再调用 `knowledge_updates.merge_knowledge()` 合并到同一页。Python 保留已有正文、Core Facts、来源链接、Related Pages 和旧元数据；aliases/tags 取并集。模型遗漏旧事实不会删除它。已有事实的稳定 ID 由事实文本生成，在生成上下文中与原文一起提供。
+`bench_ingest._validate_proposal()` 先校验模型新增内容，再调用 `knowledge_updates.merge_knowledge()` 合并到同一页。Python 保留已有正文、Facts、来源链接、Related Pages 和旧元数据；aliases/tags 取并集。旧 Core Facts 页仍可读取，更新时统一为 Facts 和 `type: knowledge`，事实 ID 不变。模型遗漏旧事实不会删除它。已有事实的稳定 ID 由事实文本生成，仅在选中已有页时提供更新协议和事实 ID。
+
+目录按主题组织，与页面 schema 独立。已有 `page_types.yaml` 继续作为目录 catalog 使用，不强制补充 entities/concepts。生成模型可在 `directories` 字段提出新目录，整批验证通过后才登记。新页只包含标题、一句话描述、带来源的 Facts 和可选 Related Pages；不重复生成 Related Sources，不要求关系链接配额。旧元数据、额外章节和未更新文件保留。
 
 新事实在更新已有页时必须附带 `change`，例如：
 
