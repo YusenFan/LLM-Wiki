@@ -102,6 +102,7 @@ def evaluate(qa_pairs: list[dict], predictions: dict) -> tuple[dict, list[dict]]
     em_sum = f1_sum = 0.0
     total = 0
     missing = 0
+    errors = 0
     steps_sum = 0
     pages_sum = 0
     hop_f1: dict[int, list[float]] = {}
@@ -117,6 +118,8 @@ def evaluate(qa_pairs: list[dict], predictions: dict) -> tuple[dict, list[dict]]
             missing += 1
             continue
         pred = predictions[qid]
+        errors += bool(pred.get("error") or pred.get("evidence_status") == "error"
+                       or pred.get("stop_reason") in {"error", "model_error"})
         prediction = pred.get("prediction", "") or ""
 
         gold = [qa["answer"]]
@@ -134,12 +137,13 @@ def evaluate(qa_pairs: list[dict], predictions: dict) -> tuple[dict, list[dict]]
         pages = len(pred.get("retrieved_titles", []) or [])
         steps_sum += steps
         pages_sum += pages
-        llm_calls += pred.get("llm_calls", 0)
+        llm_calls += pred.get("llm_calls", pred.get("retrieval_llm_calls", 0))
         elapsed_seconds += pred.get("elapsed_seconds", 0)
         citation_count += len(pred.get("citations", []))
         summary_reference_count += len(pred.get('summary_refs', []))
         gap_count += bool(pred.get("evidence_gaps"))
-        for model, counts in pred.get("usage_by_model", {}).items():
+        usage = pred.get("usage_by_model") or pred.get("retrieval_usage_by_model", {})
+        for model, counts in usage.items():
             target = usage_by_model.setdefault(model, {})
             for key, value in counts.items():
                 target[key] = target.get(key, 0) + value
@@ -171,8 +175,10 @@ def evaluate(qa_pairs: list[dict], predictions: dict) -> tuple[dict, list[dict]]
         return {}, details
 
     summary = {
+        "requested": len(qa_pairs),
         "total": total,
         "missing": missing,
+        "errors": errors,
         "em": em_sum / total,
         "f1": f1_sum / total,
         "avg_retrieval_steps": steps_sum / total,
@@ -201,7 +207,8 @@ def evaluate(qa_pairs: list[dict], predictions: dict) -> tuple[dict, list[dict]]
 # 【显示】把汇总指标输出到终端；不改变预测或评估结果。
 def _print_summary(summary: dict, dataset: str) -> None:
     print(f"\n{'='*60}\n  Evaluation — {dataset}\n{'='*60}")
-    print(f"  Total evaluated: {summary['total']}  (missing: {summary['missing']})")
+    print(f"  Requested: {summary['requested']}  evaluated: {summary['total']}  "
+          f"missing: {summary['missing']}  errors: {summary['errors']}")
     print(f"  Answer F1: {summary['f1']:.4f}  ({summary['f1']*100:.1f}%)")
     print(f"  Answer EM: {summary['em']:.4f}  ({summary['em']*100:.1f}%)")
 

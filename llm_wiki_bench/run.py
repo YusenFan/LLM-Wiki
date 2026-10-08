@@ -69,7 +69,7 @@ def step_preprocess(dataset: str, limit: int | None = None) -> bool:
 
     output_dir = RAW_DIR / dataset
     data_dir = DATA_DIR / dataset
-    stats = info["processor"](input_path, output_dir, data_dir, limit=limit)
+    stats = info["processor"](input_path, output_dir, data_dir, limit=limit, clean=True)
     print(
         f"  ✅ Preprocessed: {stats['qa_count']} QA pairs, "
         f"{stats['paragraph_count']} articles"
@@ -82,6 +82,8 @@ def step_ingest(dataset: str, batch_size: int = 3, force: bool = False,
     """Build the wiki by ingesting all preprocessed articles."""
     import bench_config as config
     import bench_ingest
+    from benchmark_metrics import append_build_metrics
+    from llm_client import reset_usage, usage_snapshot
 
     print(f"\n{'='*60}")
     print(f"  [3/3] Ingest articles into wiki: {dataset}")
@@ -103,7 +105,15 @@ def step_ingest(dataset: str, batch_size: int = 3, force: bool = False,
     print(f"  📂 Articles: {len(article_paths)}")
     print(f"  📁 Wiki output: {config.WIKI_DIR}")
 
+    reset_usage()
+    started = time.time()
     stats = bench_ingest.ingest_batch(article_paths, batch_size=batch_size, force=force)
+    metrics = append_build_metrics(
+        config.WIKI_DIR, dataset, len(article_paths), time.time() - started, stats, usage_snapshot())
+    print(f"  📊 Build metrics: {config.WIKI_DIR / 'build_metrics.json'}")
+    print(f"     duration={metrics['duration_seconds']:.1f}s  "
+          f"tokens={metrics['llm_usage_totals']['total_tokens']}  "
+          f"calls={metrics['llm_usage_totals']['calls']}")
     return stats["failed"] == 0 and stats["summaries"]["failed"] == 0
 
 

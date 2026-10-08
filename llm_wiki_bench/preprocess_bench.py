@@ -48,7 +48,8 @@ def sanitize_filename(name: str) -> str:
 
 # 【文章落盘】将去重后的标题／正文变体写成 Markdown，保留明确 source_identity；文件名加哈希避免清洗后的同名碰撞。
 # 原文版本由 article 归档对完整输入计算。
-def _write_articles(paragraphs: dict, output_dir: Path, dataset: str) -> list[str]:
+def _write_articles(paragraphs: dict, output_dir: Path, dataset: str,
+                    clean: bool = False) -> list[str]:
     """Preserve all title/text variants; source identity is separate from version.
 
     Wikipedia title identifies a source in this dataset, never a Wiki entity.
@@ -56,6 +57,9 @@ def _write_articles(paragraphs: dict, output_dir: Path, dataset: str) -> list[st
     """
     articles_dir = output_dir / "articles"
     articles_dir.mkdir(parents=True, exist_ok=True)
+    if clean:
+        for stale in articles_dir.glob("*.md"):
+            stale.unlink()
     written = []
     for (title, text) in paragraphs:
         identity = f"{dataset}:wikipedia:{title}"
@@ -72,7 +76,7 @@ def _write_articles(paragraphs: dict, output_dir: Path, dataset: str) -> list[st
 
 # 【数据转换】读取 HotpotQA JSON，按 limit 选题，收集 context 中全部不同标题／正文组合（含干扰段落），写文章和统一 qa_pairs.jsonl，返回数量统计。
 def process_hotpotqa(input_path: Path, output_dir: Path, data_dir: Path,
-                     limit: int = None) -> dict:
+                     limit: int = None, clean: bool = False) -> dict:
     """Process the HotpotQA distractor dev set.
 
     Format::
@@ -100,7 +104,7 @@ def process_hotpotqa(input_path: Path, output_dir: Path, data_dir: Path,
     for item in data:
         question = item["question"]
         answer = item["answer"]
-        supporting_titles = list(set(t for t, _ in item.get("supporting_facts", [])))
+        supporting_titles = list(dict.fromkeys(t for t, _ in item.get("supporting_facts", [])))
 
         # Extract context paragraphs.
         for title, sentences in item.get("context", []):
@@ -116,7 +120,7 @@ def process_hotpotqa(input_path: Path, output_dir: Path, data_dir: Path,
             "supporting_titles": supporting_titles,
         })
 
-    written = _write_articles(paragraphs, output_dir, "hotpotqa")
+    written = _write_articles(paragraphs, output_dir, "hotpotqa", clean=clean)
 
     # Write QA pairs.
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -135,7 +139,7 @@ def process_hotpotqa(input_path: Path, output_dir: Path, data_dir: Path,
 
 # 【数据转换】读取 MuSiQue JSONL，整理问题、别名及支撑标题并收集不同段落，输出统一文章与 QA 文件；不调用模型。
 def process_musique(input_path: Path, output_dir: Path, data_dir: Path,
-                    limit: int = None) -> dict:
+                    limit: int = None, clean: bool = False) -> dict:
     """Process the MuSiQue-Ans dev set.
 
     Format (JSONL)::
@@ -191,10 +195,10 @@ def process_musique(input_path: Path, output_dir: Path, data_dir: Path,
             "question": question,
             "answer": answer,
             "answer_aliases": item.get("answer_aliases", []),
-            "supporting_titles": list(set(supporting_titles)),
+            "supporting_titles": list(dict.fromkeys(supporting_titles)),
         })
 
-    written = _write_articles(paragraphs, output_dir, "musique")
+    written = _write_articles(paragraphs, output_dir, "musique", clean=clean)
 
     # Write QA pairs.
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -213,7 +217,7 @@ def process_musique(input_path: Path, output_dir: Path, data_dir: Path,
 
 # 【数据转换】读取 2Wiki JSON，提取题目、支撑标题与上下文文章，保留标题／正文变体并写统一文件；不调用模型。
 def process_2wikimhqa(input_path: Path, output_dir: Path, data_dir: Path,
-                      limit: int = None) -> dict:
+                      limit: int = None, clean: bool = False) -> dict:
     """Process the 2WikiMultiHopQA dev set.
 
     Format::
@@ -239,7 +243,7 @@ def process_2wikimhqa(input_path: Path, output_dir: Path, data_dir: Path,
     for item in data:
         question = item["question"]
         answer = item["answer"]
-        supporting_titles = list(set(t for t, _ in item.get("supporting_facts", [])))
+        supporting_titles = list(dict.fromkeys(t for t, _ in item.get("supporting_facts", [])))
 
         for title, sentences in item.get("context", []):
             full_text = " ".join(sentences)
@@ -253,7 +257,7 @@ def process_2wikimhqa(input_path: Path, output_dir: Path, data_dir: Path,
             "supporting_titles": supporting_titles,
         })
 
-    written = _write_articles(paragraphs, output_dir, "2wikimhqa")
+    written = _write_articles(paragraphs, output_dir, "2wikimhqa", clean=clean)
 
     # Write QA pairs.
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -325,7 +329,8 @@ def main():
         output_dir = RAW_DIR / ds_name
         data_dir = DATA_DIR / ds_name
 
-        stats = ds_info["processor"](input_path, output_dir, data_dir, limit=args.limit)
+        stats = ds_info["processor"](
+            input_path, output_dir, data_dir, limit=args.limit, clean=True)
 
         print(f"  Done {ds_name}:")
         print(f"     QA pairs:           {stats['qa_count']}")

@@ -21,6 +21,28 @@ except ImportError:
     from model_auth import auth_headers
 
 _llm_logger = logging.getLogger("ingest.llm")
+_usage_by_model: dict[str, dict[str, int]] = {}
+
+
+def reset_usage() -> None:
+    _usage_by_model.clear()
+
+
+def _record_usage(model: str, usage: dict) -> None:
+    bucket = _usage_by_model.setdefault(model, {
+        "calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+    bucket["calls"] += 1
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        bucket[key] += int((usage or {}).get(key, 0) or 0)
+
+
+def usage_snapshot() -> dict:
+    by_model = {model: dict(values) for model, values in _usage_by_model.items()}
+    return {
+        "by_model": by_model,
+        "totals": {key: sum(values[key] for values in by_model.values())
+                   for key in ("calls", "prompt_tokens", "completion_tokens", "total_tokens")},
+    }
 
 
 class ModelCallError(RuntimeError):
@@ -93,6 +115,7 @@ def _post(payload: dict, timeout: int) -> tuple[dict, dict]:
                         raise ValueError("invalid message")
                 except (ValueError, TypeError, KeyError, IndexError):
                     raise ModelCallError("LLM endpoint returned a malformed completion") from None
+                _record_usage(str(payload.get("model", "unknown")), data.get("usage", {}))
                 if choice.get("finish_reason") == "length":
                     raise ModelCallError("LLM output was truncated; increase the output token budget")
                 if choice.get("finish_reason") == "content_filter":

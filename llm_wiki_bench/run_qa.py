@@ -26,8 +26,10 @@ if str(_BENCH_DIR) not in sys.path:
     sys.path.append(str(_BENCH_DIR))
 
 import bench_config as config                        # noqa: E402
+from benchmark_metrics import add_run_metrics        # noqa: E402
 import evaluate as _evaluate                         # noqa: E402
 from llm_client import call_llm_with_tools  # noqa: E402
+from qa_run_state import compact_predictions, select_pending  # noqa: E402
 from qa_contract import validate_answer               # noqa: E402
 from wiki_agent import WikiAgent                     # noqa: E402
 from wiki_retriever import WikiRetriever             # noqa: E402
@@ -61,6 +63,8 @@ def main() -> None:
                         help="Embedding model; defaults to EMBEDDING_MODEL or text-embedding-3-large.")
     parser.add_argument("--output", "-o", default=None,
                         help="Predictions output path (default: results/<dataset>/predictions.jsonl).")
+    parser.add_argument("--resume", action="store_true",
+                        help="Keep successful records and rerun missing or failed questions.")
     parser.add_argument("--evaluate", action="store_true",
                         help="Run evaluation immediately after prediction.")
     parser.add_argument("--verbose", action="store_true")
@@ -122,10 +126,14 @@ def main() -> None:
         Path(config.BASE_DIR) / "results" / args.dataset / "predictions.jsonl"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    pending_qa = select_pending(qa_pairs, out_path, args.resume)
+    if args.resume:
+        print(f"Resume    : {len(pending_qa)} pending/failed of {len(qa_pairs)} requested questions")
 
     t0 = time.time()
-    with open(out_path, "w", encoding="utf-8") as fout:
-        for i, qa in enumerate(qa_pairs, 1):
+    mode = "a" if args.resume and out_path.exists() else "w"
+    with open(out_path, mode, encoding="utf-8") as fout:
+        for i, qa in enumerate(pending_qa, 1):
             question_started = time.time()
             question = qa["question"]
             rr = None
@@ -134,7 +142,7 @@ def main() -> None:
                 rr = agent.retrieve(question)
                 answer = rr.answer
             except (ValueError, RuntimeError, OSError) as exc:
-                print(f"  [{i}/{len(qa_pairs)}] ❌ {qa['id']}: {exc}")
+                print(f"  [{i}/{len(pending_qa)}] ❌ {qa['id']}: {exc}")
                 error = str(exc)
                 answer = {"prediction": "unknown", "evidence_chain": [], "evidence_status": "error"}
 
@@ -168,27 +176,34 @@ def main() -> None:
             fout.write(json.dumps(record, ensure_ascii=False) + "\n")
             fout.flush()
 
-            if i % 10 == 0 or i == len(qa_pairs) or args.verbose:
+            if i % 10 == 0 or i == len(pending_qa) or args.verbose:
                 elapsed = time.time() - t0
-                print(f"  [{i}/{len(qa_pairs)}] {qa['id']}  steps={record['retrieval_steps']}  "
+                print(f"  [{i}/{len(pending_qa)}] {qa['id']}  steps={record['retrieval_steps']}  "
                       f"pages={len(record['retrieved_titles'])}  ({elapsed:.1f}s)")
 
+    run_state = compact_predictions(out_path, qa_pairs)
     print(f"\nPredictions saved: {out_path}")
     print(f"Total time       : {time.time() - t0:.1f}s")
+    print(f"Completion       : {run_state['written']}/{run_state['requested']} records; "
+          f"missing={len(run_state['missing_ids'])} failed={len(run_state['failed_ids'])}")
 
     # 5. Optional evaluation.
     if args.evaluate:
         predictions = _evaluate._load_predictions(out_path)
         summary, details = _evaluate.evaluate(qa_pairs, predictions)
         if summary:
+            add_run_metrics(summary, wiki_dir, predictions)
             _evaluate._print_summary(summary, args.dataset)
-            results_dir = Path(config.BASE_DIR) / "results" / args.dataset
+            results_dir = out_path.parent
             results_dir.mkdir(parents=True, exist_ok=True)
             with open(results_dir / f"{args.dataset}_summary.json", "w", encoding="utf-8") as f:
                 json.dump(summary, f, indent=2, ensure_ascii=False)
             with open(results_dir / f"{args.dataset}_details.jsonl", "w", encoding="utf-8") as f:
                 for d in details:
                     f.write(json.dumps(d, ensure_ascii=False) + "\n")
+
+    if run_state["missing_ids"] or run_state["failed_ids"]:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -321,7 +321,9 @@ reported as unavailable; directory navigation remains accessible.
 ## Outputs and evaluation
 
 Predictions are written as JSONL, one record per question. `--output` selects the
-file and overwrites it on each run. Records include:
+file. By default it starts a fresh run; `--resume` keeps successful records,
+reruns missing or failed IDs, and compacts retries into dataset order. Evaluation
+files are written beside the selected prediction file. Records include:
 
 - The answer, evidence chain, validation status, and stop reason.
 - Read knowledge-page and article excerpts, evidence snapshots, and requirements.
@@ -338,9 +340,9 @@ python -m llm_wiki_bench.evaluate \
   --output-dir results/hotpotqa/demo-evaluation
 ```
 
-The evaluator currently reports missing predictions but excludes them from the
-EM/F1 denominator. Verify that every question in the intended evaluation scope
-has a prediction before comparing scores. `citations_validated` confirms matching
+The evaluator reports `requested`, `missing`, and `errors`; missing predictions
+remain outside the EM/F1 denominator. Require `total == requested`, `missing == 0`,
+and `errors == 0` before comparing scores. `citations_validated` confirms matching
 read snapshots, not semantic correctness. Small builds and offline tests validate
 workflow behavior; benchmark accuracy requires a completed model run with fixed
 questions, corpus, models, and budgets.
@@ -386,3 +388,16 @@ without LLM API calls.
 ## License
 
 MIT License. See [LICENSE](LICENSE).
+
+### 离线 prediction 错题分析
+
+按现有评分器的 `EM=0` 提取全部不匹配问题，保存 CSV、完整轨迹 JSONL、逐题 Markdown 和汇总 JSON：
+
+```bash
+python3 -m llm_wiki_bench.analyze_predictions \
+  --predictions wiki_output/hotpotqa/first-500/predictions.jsonl \
+  --qa-pairs data/hotpotqa/qa_pairs.jsonl \
+  --output-dir results/hotpotqa/error_analysis
+```
+
+自动归类是诊断线索，不是语义正确性裁决；缺失预测单独导出，重复预测 ID 取最后一条并在汇总中列出。脚本不调用模型、不修改原预测。500 题的具体归因和优化建议见 [prediction 错题分析](docs/prediction-error-analysis-20260920.md)。

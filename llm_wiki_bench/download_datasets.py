@@ -16,8 +16,13 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import sys
+import tempfile
+import zipfile
 from pathlib import Path
+
+import requests
 
 DATASETS_DIR = Path(__file__).parent / "datasets"
 
@@ -56,82 +61,118 @@ def download_hotpotqa(output_dir: Path):
 
 
 # 【数据下载】尝试获取 MuSiQue dev 数据并保存到目标目录；已有文件复用，失败打印手动获取提示并返回 None。
+MUSIQUE_URLS = (
+    "https://drive.usercontent.google.com/download?id=1tGdADlNjWFaHLeZZGShh2IRcpO6Lv24h&export=download&confirm=t",
+)
+TWOWIKI_URLS = (
+    "https://www.dropbox.com/s/ms2m13252h6xubs/data_ids_april7.zip?dl=1",
+    "https://www.dropbox.com/s/npidmtadreo6df2/data.zip?dl=1",
+)
+
+
+def _validate_musique(path: Path) -> int:
+    count = 0
+    with path.open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            required = {"id", "question", "answer", "paragraphs"}
+            if not isinstance(item, dict) or not required.issubset(item):
+                raise ValueError(f"invalid MuSiQue record at line {line_number}")
+            if not isinstance(item["paragraphs"], list):
+                raise ValueError(f"invalid MuSiQue paragraphs at line {line_number}")
+            count += 1
+    if not count:
+        raise ValueError("MuSiQue dev file is empty")
+    return count
+
+
+def _validate_2wikimhqa(path: Path) -> int:
+    with path.open(encoding="utf-8") as stream:
+        data = json.load(stream)
+    if not isinstance(data, list) or not data:
+        raise ValueError("2WikiMultiHopQA dev file must be a non-empty JSON array")
+    required = {"_id", "question", "answer", "context"}
+    for index, item in enumerate(data):
+        if not isinstance(item, dict) or not required.issubset(item):
+            raise ValueError(f"invalid 2WikiMultiHopQA record at index {index}")
+        if not isinstance(item["context"], list):
+            raise ValueError(f"invalid 2WikiMultiHopQA context at index {index}")
+    return len(data)
+
+
+def _download_archive_member(label: str, urls: tuple[str, ...], member_suffixes: tuple[str, ...],
+                             out_path: Path, validator) -> Path | None:
+    """Download one validated member from a publisher archive without extracting the archive."""
+    if out_path.exists():
+        try:
+            count = validator(out_path)
+            print(f"  ✅ {label} dev already verified: {count} samples -> {out_path}")
+            return out_path
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"  ⚠️ Existing {label} file is invalid; downloading again: {exc}")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f"  ⬇️  Downloading {label} dev set...")
+    for url in urls:
+        archive_path = extracted_path = None
+        try:
+            print(f"     URL: {url}", flush=True)
+            with requests.get(url, stream=True, timeout=(20, 120), allow_redirects=True) as response:
+                response.raise_for_status()
+                with tempfile.NamedTemporaryFile(dir=out_path.parent, prefix=".dataset-",
+                                                 suffix=".zip", delete=False) as stream:
+                    archive_path = Path(stream.name)
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if chunk:
+                            stream.write(chunk)
+            with zipfile.ZipFile(archive_path) as archive:
+                names = [name for name in archive.namelist() if not name.endswith("/")]
+                member = None
+                for suffix in member_suffixes:
+                    matches = [name for name in names if name.endswith(suffix)]
+                    if matches:
+                        member = min(matches, key=len)
+                        break
+                if member is None:
+                    raise ValueError(f"archive does not contain any of: {member_suffixes}")
+                with archive.open(member) as source, tempfile.NamedTemporaryFile(
+                        dir=out_path.parent, prefix=".dataset-", suffix=".part", delete=False) as target:
+                    extracted_path = Path(target.name)
+                    shutil.copyfileobj(source, target)
+            count = validator(extracted_path)
+            extracted_path.replace(out_path)
+            print(f"  ✅ {label} dev: {count} samples -> {out_path}")
+            return out_path
+        except (requests.RequestException, OSError, ValueError, json.JSONDecodeError,
+                zipfile.BadZipFile) as exc:
+            print(f"  ⚠️ Download source failed: {exc}")
+        finally:
+            if archive_path is not None:
+                archive_path.unlink(missing_ok=True)
+            if extracted_path is not None:
+                extracted_path.unlink(missing_ok=True)
+    print(f"  ❌ All {label} download sources failed; rerun to retry.")
+    return None
+
+
 def download_musique(output_dir: Path):
-    """Download the MuSiQue-Ans dev set.
-
-    Source: https://github.com/StonyBrookNLP/musique
-    """
-    import urllib.request
-    import zipfile
-
-    # MuSiQue GitHub release URL.
-    url = "https://github.com/StonyBrookNLP/musique/raw/main/data/musique_ans_v1.0_dev.jsonl"
-    out_path = output_dir / "musique_dev.jsonl"
-
-    if out_path.exists():
-        print(f"  ✅ MuSiQue dev already exists: {out_path}")
-        return out_path
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"  ⬇️  Downloading MuSiQue dev set...")
-    print(f"     URL: {url}")
-
-    try:
-        urllib.request.urlretrieve(url, str(out_path))
-        # Validate.
-        count = 0
-        with open(out_path, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    count += 1
-        print(f"  ✅ MuSiQue dev: {count} samples -> {out_path}")
-        return out_path
-    except Exception as e:
-        print(f"  ❌ Download failed: {e}")
-        print(f"  [warn] MuSiQue may need to be downloaded manually:")
-        print(f"     1. Visit https://github.com/StonyBrookNLP/musique")
-        print(f"     2. Download data/musique_ans_v1.0_dev.jsonl")
-        print(f"     3. Place it at {output_dir}/musique_dev.jsonl")
-        if out_path.exists():
-            out_path.unlink()
-        return None
+    """Download and validate the official MuSiQue-Ans dev split."""
+    return _download_archive_member(
+        "MuSiQue", MUSIQUE_URLS,
+        ("data/musique_ans_v1.0_dev.jsonl", "musique_ans_v1.0_dev.jsonl"),
+        output_dir / "data" / "musique_ans_v1.0_dev.jsonl", _validate_musique,
+    )
 
 
-# 【数据下载】尝试获取 2Wiki dev JSON；已有文件复用，失败提示其他获取方式并返回 None。
 def download_2wikimhqa(output_dir: Path):
-    """Download the 2WikiMultiHopQA dev set.
-
-    Source: https://github.com/Alab-NII/2wikimultihop
-    """
-    import urllib.request
-
-    url = "https://github.com/Alab-NII/2wikimultihop/raw/main/data/dev.json"
-    out_path = output_dir / "2wikimhqa_dev.json"
-
-    if out_path.exists():
-        print(f"  ✅ 2WikiMultiHopQA dev already exists: {out_path}")
-        return out_path
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"  ⬇️  Downloading 2WikiMultiHopQA dev set...")
-    print(f"     URL: {url}")
-
-    try:
-        urllib.request.urlretrieve(url, str(out_path))
-        # Validate.
-        with open(out_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        print(f"  ✅ 2WikiMultiHopQA dev: {len(data)} samples -> {out_path}")
-        return out_path
-    except Exception as e:
-        print(f"  ❌ Download failed: {e}")
-        print(f"  [warn] 2WikiMultiHopQA may need to be downloaded manually:")
-        print(f"     1. Visit https://github.com/Alab-NII/2wikimultihop")
-        print(f"     2. Download data/dev.json")
-        print(f"     3. Place it at {output_dir}/2wikimhqa_dev.json")
-        if out_path.exists():
-            out_path.unlink()
-        return None
+    """Download and validate the official 2WikiMultiHopQA dev split."""
+    return _download_archive_member(
+        "2WikiMultiHopQA", TWOWIKI_URLS,
+        ("data_ids/dev.json", "data/dev.json", "wikimultihop/dev.json", "dev.json"),
+        output_dir / "data" / "dev.json", _validate_2wikimhqa,
+    )
 
 
 DATASET_DOWNLOADERS = {
