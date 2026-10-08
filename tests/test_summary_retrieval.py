@@ -205,7 +205,7 @@ class EmbeddingCacheTest(unittest.TestCase):
             'usage': {'prompt_tokens': 7}}))
 
     def test_response_order_cache_reuse_content_and_model_invalidation(self):
-        with patch('embedding_client.requests.post') as post:
+        with patch('embedding_client._session.post') as post:
             post.return_value = self.response([[1., 0.], [0., 2.]])
             first = EmbeddingClient(self.path, model='model-a')
             self.assertEqual(first.embed(['alpha', 'beta']), [[1., 0.], [0., 1.]])
@@ -226,7 +226,7 @@ class EmbeddingCacheTest(unittest.TestCase):
             self.assertEqual(client.api_key, '')
 
     def test_bad_vectors_fail_without_being_cached_or_exposing_response(self):
-        with patch('embedding_client.requests.post') as post:
+        with patch('embedding_client._session.post') as post:
             post.return_value = self.response([[float('nan'), 1.]])
             with self.assertRaisesRegex(RuntimeError, 'malformed vectors'):
                 EmbeddingClient(self.path).embed(['alpha'])

@@ -3,11 +3,25 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 TOKEN_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens")
+
+
+def latency_percentiles(rows: list[dict]) -> dict:
+    values = sorted(float(row['elapsed_seconds']) for row in rows
+                    if isinstance(row.get('elapsed_seconds'), (int, float))
+                    and math.isfinite(row['elapsed_seconds']))
+    def percentile(fraction):
+        if not values:
+            return None
+        position = (len(values) - 1) * fraction
+        left, right = math.floor(position), math.ceil(position)
+        return values[left] + (values[right] - values[left]) * (position - left)
+    return {"p50_elapsed_seconds": percentile(.5), "p95_elapsed_seconds": percentile(.95)}
 
 
 def _merge_usage(*groups: dict) -> dict:
@@ -64,7 +78,8 @@ def append_build_metrics(wiki_dir: Path, dataset: str, article_count: int,
     return report
 
 
-def add_run_metrics(summary: dict, wiki_dir: Path, predictions: dict[str, dict]) -> dict:
+def add_run_metrics(summary: dict, wiki_dir: Path, predictions: dict[str, dict],
+                    run_metadata: dict | None = None) -> dict:
     """Attach construction and final compacted QA usage to an evaluation summary."""
     build_path = Path(wiki_dir) / "build_metrics.json"
     summary["wiki_construction"] = (
@@ -88,5 +103,10 @@ def add_run_metrics(summary: dict, wiki_dir: Path, predictions: dict[str, dict])
         "llm_usage_by_model": by_model,
         "llm_usage_totals": usage_totals(by_model),
         "embedding_usage_by_model": embedding,
+        **latency_percentiles(rows),
     }
+    if run_metadata is not None:
+        summary["qa_run"]["startup_seconds"] = run_metadata.get("startup_seconds")
+        summary["qa_run"]["index_preparation"] = run_metadata.get("index_preparation")
+        summary["qa_run"]["qa_wall_seconds"] = run_metadata.get("qa_wall_seconds")
     return summary

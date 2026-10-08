@@ -2,14 +2,22 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import json
 import re
 import sqlite3
+import sys
+import tempfile
+import time
+from array import array
 from collections import Counter, defaultdict
 from dataclasses import dataclass
+from pathlib import Path
 
 from embedding_client import unit_vector
 from token_budget import TokenBudget, dumps
 from wiki_documents import parse_document, resolve_wiki_link
+from request_budget import DeadlineExceeded, remaining_seconds
 
 
 def terms(text: str) -> list[str]:
@@ -59,7 +67,8 @@ class SummaryDocument:
 
 
 class SummaryIndex:
-    def __init__(self, pages: dict, *, mode: str, embedder=None, candidate_k: int = 20):
+    def __init__(self, pages: dict, *, mode: str, embedder=None, candidate_k: int = 20,
+                 cache_dir: Path | None = None):
         if mode not in {"bm25", "dense", "hybrid"}:
             raise ValueError("summary mode must be bm25, dense or hybrid")
         if type(candidate_k) is not int or not 1 <= candidate_k <= 200:
@@ -88,10 +97,109 @@ class SummaryIndex:
         self.bm25 = BM25([doc.search_text for doc in self.docs])
         self._chunks = None
         self._dense_error = None
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self.index_status = "missing" if mode != "bm25" else "disabled"
+        settings = [getattr(embedder, key, None) for key in
+                    ("model", "namespace", "endpoint", "dimensions", "query_instruction",
+                     "chunk_tokens", "max_input_bytes", "tokenizer_model")]
+        identity = ["summary-index-v1", settings, [(doc.path, doc.search_text) for doc in self.docs]]
+        self.fingerprint = hashlib.sha256(dumps(identity).encode("utf-8")).hexdigest()
+        if mode != "bm25":
+            self.load_prepared_index()
 
-    def _dense(self, query: str, excluded: set[str]) -> list[tuple[int, float]]:
+    def load_prepared_index(self) -> bool:
+        """Validate a non-executable binary snapshot against the current corpus and provider."""
+        if self.cache_dir is None:
+            return False
+        manifest_path = self.cache_dir / "summary-index.json"
+        if not manifest_path.exists():
+            return False
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("invalid snapshot manifest")
+            if manifest.get("schema") != "summary-index-v1" or manifest.get("fingerprint") != self.fingerprint:
+                self.index_status = "stale"
+                return False
+            checksum = manifest.pop("manifest_sha256", None)
+            if checksum != hashlib.sha256(dumps(manifest).encode("utf-8")).hexdigest():
+                raise ValueError("snapshot metadata checksum mismatch")
+            dimensions, owners = manifest["dimensions"], manifest["owners"]
+            if (type(dimensions) is not int or dimensions < 1 or not isinstance(owners, list)
+                    or not owners or any(type(i) is not int or not 0 <= i < len(self.docs) for i in owners)
+                    or set(owners) != set(range(len(self.docs)))
+                    or manifest["doc_paths"] != [doc.path for doc in self.docs]
+                    or manifest.get("byteorder") not in {"little", "big"}):
+                raise ValueError("invalid snapshot metadata")
+            expected_dimensions = getattr(self.embedder, "dimensions", None)
+            if expected_dimensions is not None and dimensions != expected_dimensions:
+                raise ValueError("snapshot dimensions changed")
+            data = (self.cache_dir / f"summary-index-{self.fingerprint}.bin").read_bytes()
+            values = array("d")
+            if len(data) != len(owners) * dimensions * values.itemsize:
+                raise ValueError("snapshot size does not match metadata")
+            if hashlib.sha256(data).hexdigest() != manifest["vector_sha256"]:
+                raise ValueError("snapshot checksum mismatch")
+            values.frombytes(data)
+            if manifest["byteorder"] != sys.byteorder:
+                values.byteswap()
+            view = memoryview(values)
+            chunks = [(owner, view[i * dimensions:(i + 1) * dimensions]) for i, owner in enumerate(owners)]
+            for _, vector in chunks:
+                if any(not math.isfinite(x) for x in vector) or abs(sum(x * x for x in vector) - 1) > 1e-6:
+                    raise ValueError("snapshot contains invalid vectors")
+            self._chunks = chunks
+            self.index_status = "loaded"
+            return True
+        except (OSError, ValueError, KeyError, TypeError, OverflowError):
+            self.index_status = "invalid"
+            return False
+
+    def _save_prepared_index(self) -> None:
+        if self.cache_dir is None or not self._chunks:
+            return
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        values = array("d", (x for _, vector in self._chunks for x in vector))
+        data = values.tobytes()
+        manifest = {"schema": "summary-index-v1", "fingerprint": self.fingerprint,
+                    "dimensions": len(self._chunks[0][1]), "byteorder": sys.byteorder,
+                    "owners": [owner for owner, _ in self._chunks],
+                    "doc_paths": [doc.path for doc in self.docs],
+                    "vector_sha256": hashlib.sha256(data).hexdigest()}
+        manifest["manifest_sha256"] = hashlib.sha256(dumps(manifest).encode("utf-8")).hexdigest()
+        for target, content in [(self.cache_dir / f"summary-index-{self.fingerprint}.bin", data),
+                                (self.cache_dir / "summary-index.json", dumps(manifest).encode("utf-8"))]:
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=self.cache_dir, delete=False) as stream:
+                    temporary = Path(stream.name)
+                    stream.write(content)
+                temporary.replace(target)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+
+    def prepare_index(self) -> dict:
+        """Prepare document vectors without embedding a question."""
+        started = time.monotonic()
+        if self.mode == "bm25" or not self.docs:
+            return {"status": "disabled" if self.mode == "bm25" else "empty",
+                    "summary_count": len(self.docs), "chunks": 0, "elapsed_seconds": time.monotonic() - started}
         if self._dense_error:
             raise RuntimeError(self._dense_error)
+        try:
+            self._prepare_chunks()
+        except DeadlineExceeded:
+            raise
+        except (RuntimeError, ValueError, OSError, sqlite3.Error) as error:
+            self._dense_error = str(error)
+            raise
+        return {"status": self.index_status, "fingerprint": self.fingerprint,
+                "summary_count": len(self.docs), "chunks": len(self._chunks),
+                "elapsed_seconds": time.monotonic() - started}
+
+    def _prepare_chunks(self) -> None:
+        remaining_seconds()
         if self.embedder is None:
             raise RuntimeError("No embedding client configured")
         if self._chunks is None:
@@ -115,6 +223,13 @@ class SummaryIndex:
             if len(vectors) != len(texts):
                 raise RuntimeError("Embedding client returned the wrong document count")
             self._chunks = [(i, unit_vector(v)) for i, v in zip(owners, vectors)]
+            if len({len(vector) for _, vector in self._chunks}) > 1:
+                raise RuntimeError("Document embedding dimensions differ")
+            self._save_prepared_index()
+            self.index_status = "built"
+
+    def _dense(self, query: str, excluded: set[str]) -> list[tuple[int, float]]:
+        self.prepare_index()
         vector = unit_vector(getattr(self.embedder, "embed_queries", self.embedder.embed)([query])[0])
         scores = {}
         for i, document in self._chunks:
@@ -128,6 +243,7 @@ class SummaryIndex:
 
     def search(self, query: str, *, tokenizer: TokenBudget, limit: int = 5,
                token_budget: int = 4000, offset: int = 0, exclude_paths: list[str] | None = None) -> dict:
+        remaining_seconds()
         if not isinstance(query, str) or not query.strip() or tokenizer.count(query) > 512:
             raise ValueError("query must be nonempty and at most 512 tokens")
         if type(limit) is not int or not 1 <= limit <= 10:
@@ -147,6 +263,8 @@ class SummaryIndex:
         if self.docs and self.mode != "bm25":
             try:
                 dense = self._dense(query, excluded)
+            except DeadlineExceeded:
+                raise
             except (RuntimeError, ValueError, OSError, sqlite3.Error) as error:
                 self._dense_error = str(error)
                 effective = "bm25" if self.mode == "hybrid" else "unavailable"

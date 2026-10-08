@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -54,13 +55,25 @@ def main() -> None:
                         help="Deprecated alias for --retrieval-model; the unified loop uses one model.")
     parser.add_argument("--summary-mode", choices=["hybrid", "bm25", "dense", "tree"], default="hybrid",
                         help="Initial summary retrieval method (default hybrid); tree is the navigation baseline.")
-    parser.add_argument("--summary-limit", type=int, default=5, help="Summaries initially shown, 1-10 (default 5).")
+    parser.add_argument("--summary-limit", type=int, default=5, help="Configured summary batch limit, 1-10 (default 5); adaptive retrieval can adjust it.")
     parser.add_argument("--summary-candidates", type=int, default=20,
                         help="Candidates per retriever before RRF (default 20).")
     parser.add_argument("--summary-token-budget", type=int, default=4000,
-                        help="Max serialized tokens per summary_search/wiki_read response, 512-16000 (default 4000).")
+                        help="Max serialized summary tokens, 512-16000 (default 4000); baseline also uses it for reads unless --read-token-budget is set.")
     parser.add_argument("--embedding-model", default=None,
                         help="Embedding model; defaults to EMBEDDING_MODEL or text-embedding-3-large.")
+    parser.add_argument("--qa-profile", choices=["baseline", "latency"], default=None,
+                        help="Default latency for 2Wiki/HotpotQA; baseline preserves the original navigation loop.")
+    parser.add_argument("--prefetch-pages", type=int, default=None,
+                        help="Pages automatically read before the first model turn, 0-10; latency default 2.")
+    parser.add_argument("--read-token-budget", type=int, default=None,
+                        help="Independent wiki_read budget, 512-16000; latency default 4000.")
+    parser.add_argument("--adaptive-retrieval", action=argparse.BooleanOptionalAction, default=None,
+                        help="Adjust summary limits and exclude seen candidates; latency default enabled.")
+    parser.add_argument("--prepare-index", action=argparse.BooleanOptionalAction, default=None,
+                        help="Prepare/load document vectors before timing questions; latency default enabled.")
+    parser.add_argument("--question-time-budget", type=float, default=None,
+                        help="Cooperative time budget shared by a question's requests/retries; 0 disables. Latency default 120s.")
     parser.add_argument("--output", "-o", default=None,
                         help="Predictions output path (default: results/<dataset>/predictions.jsonl).")
     parser.add_argument("--resume", action="store_true",
@@ -69,6 +82,13 @@ def main() -> None:
                         help="Run evaluation immediately after prediction.")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+    profile = args.qa_profile or ("latency" if args.dataset in {"hotpotqa", "2wikimhqa"} else "baseline")
+    latency = profile == "latency"
+    prefetch_pages = args.prefetch_pages if args.prefetch_pages is not None else (2 if latency and args.summary_mode != "tree" else 0)
+    read_token_budget = args.read_token_budget if args.read_token_budget is not None else (4000 if latency else None)
+    adaptive = args.adaptive_retrieval if args.adaptive_retrieval is not None else latency and args.summary_mode != "tree"
+    prepare_index = args.prepare_index if args.prepare_index is not None else latency
+    time_budget = args.question_time_budget if args.question_time_budget is not None else (120.0 if latency else 0.0)
 
     if args.t_max < 1:
         parser.error("t-max must be positive")
@@ -76,6 +96,12 @@ def main() -> None:
         parser.error("summary-limit must be 1-10 and summary-candidates must be between summary-limit and 200")
     if not 512 <= args.summary_token_budget <= 16000:
         parser.error("summary-token-budget must be 512-16000")
+    if not 0 <= prefetch_pages <= 10:
+        parser.error("prefetch-pages must be 0-10")
+    if read_token_budget is not None and not 512 <= read_token_budget <= 16000:
+        parser.error("read-token-budget must be 512-16000")
+    if not math.isfinite(time_budget) or time_budget < 0:
+        parser.error("question-time-budget must be finite and nonnegative")
     if args.answer_model and args.retrieval_model and args.answer_model != args.retrieval_model:
         parser.error("the unified agent uses one model; choose --retrieval-model only")
 
@@ -103,15 +129,32 @@ def main() -> None:
           f"summary_limit={args.summary_limit}  navigation_token_budget={args.summary_token_budget}")
 
     # 3. Initialize retriever + agent.
+    startup_started = time.monotonic()
     retrieval_model = args.retrieval_model or args.answer_model or getattr(config, "LLM_PREMIUM_MODEL", None) or config.LLM_MODEL
     retriever = WikiRetriever(wiki_dir, summary_mode=args.summary_mode, summary_limit=args.summary_limit,
                               summary_candidates=args.summary_candidates,
                               summary_token_budget=args.summary_token_budget,
-                              embedding_model=args.embedding_model, tokenizer_model=retrieval_model)
+                              embedding_model=args.embedding_model, tokenizer_model=retrieval_model,
+                              read_token_budget=read_token_budget, evidence_tools=bool(prefetch_pages or adaptive))
     retriever.load()
     print(f"Loaded   : {len(retriever.pages)} pages, {len(retriever.dir_indexes)} directory indices")
     if not any(page.layer in {"knowledge", "articles"} for page in retriever.pages.values()):
         parser.error("this wiki has no knowledge pages or article evidence; rebuild using --wiki-dir")
+    index_report = {"status": "deferred", "mode": args.summary_mode}
+    if prepare_index:
+        before_index_usage = dict(retriever.embedder.stats)
+        try:
+            index_report = retriever.prepare_index()
+        except (ValueError, RuntimeError, OSError) as exc:
+            if args.summary_mode == "dense":
+                parser.error(f"dense index preparation failed: {exc}")
+            index_report = {"status": "unavailable", "mode": args.summary_mode, "error": str(exc),
+                            "embedding_usage": {key: value - before_index_usage.get(key, 0)
+                                                for key, value in retriever.embedder.stats.items()}}
+            print(f"Index preparation unavailable; hybrid will report its BM25 fallback: {exc}")
+    startup_seconds = time.monotonic() - startup_started
+    print(f"QA profile: {profile}; prefetch={prefetch_pages}; adaptive={adaptive}; time_budget={time_budget}s")
+    print(f"Index     : {index_report['status']} ({startup_seconds:.1f}s startup)")
 
     agent = WikiAgent(
         retriever,
@@ -119,6 +162,9 @@ def main() -> None:
         model=retrieval_model,
         t_max=args.t_max,
         verbose=args.verbose,
+        prefetch_pages=prefetch_pages,
+        adaptive_retrieval=adaptive,
+        question_time_budget=time_budget or None,
     )
 
     # 4. Run.
@@ -166,12 +212,19 @@ def main() -> None:
                 "initial_navigation": rr.initial_navigation if rr else {},
                 "summary_searches": rr.summary_searches if rr else [],
                 "embedding_usage": rr.embedding_usage if rr else {},
+                "timings": rr.timings if rr else {},
+                "llm_turns": rr.llm_turns if rr else [],
+                "network_stats": rr.network_stats if rr else {},
+                "navigation_progress": rr.navigation_progress if rr else [],
                 "elapsed_seconds": round(time.time() - question_started, 3),
                 "retrieval_config": {"summary_mode": args.summary_mode, "summary_limit": args.summary_limit,
                                      "summary_candidates": args.summary_candidates,
                                      "summary_token_budget": args.summary_token_budget,
+                                     "read_token_budget": retriever.read_token_budget,
+                                     "qa_profile": profile, "prefetch_pages": prefetch_pages,
+                                     "adaptive_retrieval": adaptive, "question_time_budget": time_budget,
                                      "tokenizer": retriever.tokenizer.name},
-                "error": error,
+                "error": error or (rr.error if rr else None),
             }
             fout.write(json.dumps(record, ensure_ascii=False) + "\n")
             fout.flush()
@@ -182,6 +235,10 @@ def main() -> None:
                       f"pages={len(record['retrieved_titles'])}  ({elapsed:.1f}s)")
 
     run_state = compact_predictions(out_path, qa_pairs)
+    run_metadata = {"dataset": args.dataset, "qa_profile": profile, "index_preparation": index_report,
+                    "startup_seconds": startup_seconds, "qa_wall_seconds": time.time() - t0,
+                    "questions_run": len(pending_qa), "completion": run_state}
+    out_path.with_suffix(".run.json").write_text(json.dumps(run_metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"\nPredictions saved: {out_path}")
     print(f"Total time       : {time.time() - t0:.1f}s")
     print(f"Completion       : {run_state['written']}/{run_state['requested']} records; "
@@ -192,7 +249,7 @@ def main() -> None:
         predictions = _evaluate._load_predictions(out_path)
         summary, details = _evaluate.evaluate(qa_pairs, predictions)
         if summary:
-            add_run_metrics(summary, wiki_dir, predictions)
+            add_run_metrics(summary, wiki_dir, predictions, run_metadata=run_metadata)
             _evaluate._print_summary(summary, args.dataset)
             results_dir = out_path.parent
             results_dir.mkdir(parents=True, exist_ok=True)

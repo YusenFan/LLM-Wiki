@@ -21,6 +21,8 @@ import sys
 from collections import Counter
 from pathlib import Path
 
+from benchmark_metrics import latency_percentiles
+
 BASE_DIR = Path(__file__).parent.parent
 DATA_DIR = BASE_DIR / "data"
 RESULTS_DIR = BASE_DIR / "results"
@@ -185,6 +187,7 @@ def evaluate(qa_pairs: list[dict], predictions: dict) -> tuple[dict, list[dict]]
         "avg_pages_read": pages_sum / total,
         "avg_llm_calls": llm_calls / total,
         "avg_elapsed_seconds": elapsed_seconds / total,
+        **latency_percentiles([predictions[qa["id"]] for qa in qa_pairs if qa["id"] in predictions]),
         "avg_citations": citation_count / total,
         "avg_summary_references": summary_reference_count / total,
         "evidence_gap_rate": gap_count / total,

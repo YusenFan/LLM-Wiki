@@ -135,7 +135,23 @@ snapshot. Complete coverage requires a successful build of all groups; check
 ### 5. Retrieve, read, and answer in one agent loop
 
 `run_qa` loads a Wiki snapshot and starts one `WikiAgent` conversation per question.
-Its initial navigation retrieves current summaries using BM25 and dense
+For HotpotQA and 2Wiki, the default `latency` profile prepares or loads document
+vectors before questions, looks up unambiguous titles/aliases, and pre-reads up
+to two knowledge pages. The agent can combine missing-hop retrieval and reading
+with `retrieve_evidence`. Pre-reading costs one batch-read slot, and combined
+navigation plus reading costs two slots. Use `--qa-profile baseline` to compare
+the original navigation policy, or toggle `--prefetch-pages 0`,
+`--no-adaptive-retrieval`, and `--no-prepare-index` independently. Full conversation
+history is retained. See [QA configuration and timing](docs/qa-agent-loop.md).
+
+Prepare existing Wikis with `python -m llm_wiki_bench.prepare_retrieval --dataset
+hotpotqa --wiki-dir <wiki>`, or add `--prepare-retrieval-index` to construction.
+Snapshots are invalidated by corpus or embedding configuration changes.
+The default latency time budget is 120 seconds per question, shared by requests
+and retries; `--question-time-budget 0` disables it. Timing and failure details
+are saved alongside predictions, including separate startup/index costs.
+
+Summary navigation retrieves current summaries using BM25 and dense
 embeddings, then combines their ranks with reciprocal rank fusion (RRF).
 Only summaries enter this search index. Knowledge pages and articles are reached
 through page links, known paths, or directory browsing.

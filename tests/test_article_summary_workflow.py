@@ -315,7 +315,8 @@ class WorkflowTest(unittest.TestCase):
             with self.subTest(link=link):
                 passage = json.loads(retriever.execute_tool('source_read', {
                     'article': link, 'start_line': 7, 'end_line': 7}))
-                self.assertEqual({k: v for k, v in passage.items() if k != 'evidence'}, self.citation)
+                self.assertEqual({k: passage[k] for k in self.citation}, self.citation)
+                self.assertEqual(passage.get('next_start_line'), 8)
                 self.assertEqual(retriever.read([link])[0]['path'], passage['article'])
 
     def test_resolved_source_links_still_enforce_article_and_range_contracts(self):
@@ -325,7 +326,7 @@ class WorkflowTest(unittest.TestCase):
                         'sources/articles/missing', None):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 retriever.source_read(invalid, 1, 1)
-        for start, end in ((0, 1), (8, 7), (1, 201), (1, 9), (True, 7)):
+        for start, end in ((0, 1), (8, 7), (1, 201), (True, 7)):
             with self.subTest(start=start, end=end), self.assertRaises(ValueError):
                 retriever.source_read(self.article['article'][:-3], start, end)
 

@@ -12,6 +12,10 @@ from pathlib import Path
 import requests
 
 from model_auth import auth_headers
+from request_budget import record_request, remaining_seconds, request_timeout, retry_sleep
+
+
+_session = requests.Session()
 
 
 def unit_vector(value) -> list[float]:
@@ -72,19 +76,30 @@ class EmbeddingClient:
         if self.dimensions is not None:
             body["dimensions"] = self.dimensions
         for attempt in range(2):
+            remaining_seconds()
             self.stats["requests"] += 1
+            started = time.monotonic()
+            transport_failed = False
             try:
-                response = requests.post(self.endpoint,
+                response = _session.post(self.endpoint,
                                          headers=auth_headers("EMBEDDING", self.api_key, self.endpoint),
-                                         json=body, timeout=self.timeout)
+                                         json=body, timeout=request_timeout(self.timeout))
             except requests.RequestException:
+                transport_failed = True
+            finally:
+                record_request("embedding", time.monotonic() - started)
+            if transport_failed:
                 if attempt == 0:
-                    time.sleep(1)
+                    retry_sleep("embedding", 1)
                     continue
                 raise RuntimeError("Embedding endpoint could not be reached") from None
             if response.status_code == 429 or response.status_code >= 500:
                 if attempt == 0:
-                    time.sleep(1)
+                    try:
+                        delay = min(60, max(0, float(response.headers.get("Retry-After", 1))))
+                    except (TypeError, ValueError):
+                        delay = 1
+                    retry_sleep("embedding", delay)
                     continue
             if not response.ok:
                 # Do not expose headers, credentials, or vendor response bodies in QA logs.
@@ -110,6 +125,7 @@ class EmbeddingClient:
         raise RuntimeError("Embedding request failed")
 
     def embed(self, texts: list[str]) -> list[list[float]]:
+        remaining_seconds()
         if not texts:
             return []
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)

@@ -78,7 +78,8 @@ def step_preprocess(dataset: str, limit: int | None = None) -> bool:
 
 
 def step_ingest(dataset: str, batch_size: int = 3, force: bool = False,
-                wiki_dir: Path | None = None) -> bool:
+                wiki_dir: Path | None = None, prepare_retrieval_index: bool = False,
+                embedding_model: str | None = None) -> bool:
     """Build the wiki by ingesting all preprocessed articles."""
     import bench_config as config
     import bench_ingest
@@ -108,6 +109,9 @@ def step_ingest(dataset: str, batch_size: int = 3, force: bool = False,
     reset_usage()
     started = time.time()
     stats = bench_ingest.ingest_batch(article_paths, batch_size=batch_size, force=force)
+    if prepare_retrieval_index and stats["failed"] == 0 and stats["summaries"]["failed"] == 0:
+        from prepare_retrieval import prepare
+        stats["retrieval_index"] = prepare(config.WIKI_DIR, embedding_model=embedding_model)
     metrics = append_build_metrics(
         config.WIKI_DIR, dataset, len(article_paths), time.time() - started, stats, usage_snapshot())
     print(f"  📊 Build metrics: {config.WIKI_DIR / 'build_metrics.json'}")
@@ -129,7 +133,8 @@ def run_one(dataset: str, args) -> bool:
     if args.only_ingest or args.only is None or args.only == "ingest":
         if ok:
             ok = ok and step_ingest(
-                dataset, batch_size=args.batch_size, force=args.force, wiki_dir=args.wiki_dir
+                dataset, batch_size=args.batch_size, force=args.force, wiki_dir=args.wiki_dir,
+                prepare_retrieval_index=args.prepare_retrieval_index, embedding_model=args.embedding_model
             )
     print(f"\n  ⏱  Total time for {dataset}: {time.time() - t0:.1f}s")
     return ok
@@ -153,6 +158,9 @@ def main():
     parser.add_argument("--force", action="store_true",
                         help="Re-ingest articles even if cached.")
     parser.add_argument("--wiki-dir", type=Path, help="Build into a separate wiki directory and cache.")
+    parser.add_argument("--prepare-retrieval-index", action="store_true",
+                        help="Prepare document embeddings and a reusable index after a successful Wiki build.")
+    parser.add_argument("--embedding-model", help="Embedding model used by --prepare-retrieval-index.")
 
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--skip-preprocess", action="store_true")
